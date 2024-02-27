@@ -7,7 +7,6 @@ infrastructure as code (IaC) workflows, enabling automated build, test, and depl
 - Custom Jenkins Agent: Based on the official Jenkins agent image, customized to support Terraform Cloud automation.
 - HashiCorp TFC Workflows Tooling Integration: Automates Terraform Cloud Runs, enhancing IaC practices with Jenkins.
 - Go Application Support: Includes Go for building and running Go-based applications, specifically the tfc-workflows-tooling.
-- Optimized Dockerfile: Carefully crafted to maintain a balance between functionality and image size, ensuring efficient CI/CD pipelines.
 
 ## Getting Started
 To use this custom Jenkins agent, you will need Docker installed on your machine. Follow these steps to build and run your custom Jenkins agent Docker image.
@@ -29,7 +28,7 @@ This integration allows Jenkins to dynamically launch this agent container whene
 
 #### Steps for Configuration:
 1. Install the Docker Plugin: Ensure the Docker plugin is installed in Jenkins to allow Jenkins to provision agents using Docker.
-2. Configure a Docker Cloud in Jenkins**:
+2. Configure a Docker Cloud in Jenkins:
    - Navigate to *Manage Jenkins > Manage Nodes and Clouds > Configure Clouds*.
    - Add a new Docker Cloud and configure it with your Docker host's details.
    - Under the Docker Cloud configuration, add a new Docker Agent template.
