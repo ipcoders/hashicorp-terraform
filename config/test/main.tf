@@ -12,6 +12,6 @@ provider "local" {
 }
 
 resource "local_file" "foo" {
-  content  = "Hello Team!"
+  content  = "Jenkins Demo for Tony and Nathaniel"
   filename = "hello.txt"
 }
