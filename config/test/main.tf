@@ -13,6 +13,7 @@ provider "local" {
 
 variable "ip_address" {
   type = string
+  default = "192.168.1.10"
 }
 
 resource "local_file" "foo" {
