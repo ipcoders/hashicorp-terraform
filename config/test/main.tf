@@ -11,6 +11,10 @@ provider "local" {
   # Configuration options
 }
 
+variable "ip_address" {
+  type = string
+}
+
 resource "local_file" "foo" {
   content  = var.ip_address
   filename = "msg.txt"
