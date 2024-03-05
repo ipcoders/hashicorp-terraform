@@ -12,6 +12,6 @@ provider "local" {
 }
 
 resource "local_file" "foo" {
-  content  = "Jenkins Demo for Tony and Nathaniel"
-  filename = "hello.txt"
+  content  = var.ip_address
+  filename = "msg.txt"
 }
