@@ -16,7 +16,7 @@ SHELL ["/bin/bash","-e", "-u", "-o", "pipefail", "-c"]
 ARG user=jenkins
 USER root
 WORKDIR /home/"${user}"
-RUN apt-get update && apt-get install -y golang-go && \
+RUN apt-get update && apt-get install -y golang-go jq && \
     git clone https://github.com/hashicorp/tfc-workflows-tooling.git tfc_repo
 
 WORKDIR /home/"${user}"/tfc_repo
