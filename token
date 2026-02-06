@@ -16,7 +16,7 @@
         dns_configs: []
         all_dhclient_files: []
         disable_dhclient: false
-        valid_nameservers: ["1.1.1.1", "1.1.1.2"]
+        valid_nameservers: ["1.1.1.1", "2.2.2.2"]
 
     - name: Reachability check
       ansible.builtin.wait_for_connection:
@@ -554,18 +554,66 @@
 
     - name: Set variables
       ansible.builtin.set_fact:
-        _valid_vm: "{{ (_rows_ifcfg | selectattr('msg', 'defined') | selectattr('msg', 'equalto', 'valid') | map(attribute='host') | list | sort) }}"
+        _valid_ifcfg_hosts: "{{ (_rows_ifcfg | default([]))
+          | selectattr('ifcfg_is', 'defined')
+          | selectattr('ifcfg_is', 'equalto', 'valid')
+          | map(attribute='host') | list | unique | sort }}"
+
+        _valid_resolv_hosts: "{{ (_rows_resolv | default([]))
+          | selectattr('msg', 'defined')
+          | selectattr('msg', 'equalto', 'valid')
+          | map(attribute='host') | list | unique | sort }}"
+
         _invalid_zone: "{{ (_rows_ifcfg | selectattr('msg', 'defined') | selectattr('msg', 'equalto', 'invalid_zone') | map(attribute='host') | list | sort) }}"
+
         _unreachable_vm: "{{ (_rows_ifcfg | selectattr('msg', 'defined') | selectattr('msg', 'equalto', 'unreachable_vm') | map(attribute='host') | list | sort) }}"
-        _invalid_vm: "{{ (_rows_ifcfg | selectattr('msg', 'defined') | selectattr('msg', 'ne', 'valid') | map(attribute='host') | list | sort) }}"
+
         _invalid_nics: "{{ (_rows_ifcfg | selectattr('msg', 'equalto', 'invalid_nics') | map(attribute='host') | list | sort) }}"
+
         _all_vms: "{{ (_rows_ifcfg | map(attribute='host') | list | sort) }}"
+
         _compliant_resolv: "{{ (_rows_resolv | selectattr('msg', 'defined') | selectattr('msg', 'equalto', 'valid') | map(attribute='host') | list | sort) }}"
+
         _noncompliant_resolv: "{{ (_rows_resolv | selectattr('msg', 'defined') | selectattr('msg', 'equalto', 'invalid') | map(attribute='host') | list | sort) }}"
+
         _noncompliant_ifcfg: "{{ (_rows_ifcfg | selectattr('ifcfg_is', 'defined') | selectattr('ifcfg_is', 'equalto', 'invalid') | map(attribute='host') | list | sort) }}"
+
         _compliant_ifcfg: "{{ (_rows_ifcfg | selectattr('ifcfg_is', 'defined') | selectattr('ifcfg_is', 'equalto', 'valid') | map(attribute='host') | list | sort) }}"
+
         _vm_with_dhclient: "{{ (_rows_resolv | selectattr('disable_dhclient', 'defined') | selectattr('disable_dhclient', 'equalto', true) | map(attribute='host') | list) }}"
+
         _all_dhclient_files: "{{ (_rows_resolv | selectattr('all_dhclient_files', 'defined') | map(attribute='all_dhclient_files') | flatten) }}"
+
+    - name: Set variables
+      ansible.builtin.set_fact:
+        _precheck_ok: >-
+          {{
+            (_all_vms | default([]))
+            | difference(_unreachable_vm | default([]))
+            | difference(_invalid_zone | default([]))
+            | difference(_invalid_nics | default([]))
+            | sort
+          }}
+          
+    - name: Set variables
+      ansible.builtin.set_fact:
+        _valid_vm: >-
+          {{ 
+            (_valid_ifcfg_hosts | default([]))
+            | intersect(_valid_resolv_hosts | default([]))
+            | unique | sort 
+          }}
+        _invalid_vm: >-
+          {{ 
+            (
+              (_noncompliant_ifcfg | default([]))
+              | union(_noncompliant_resolv | default([]))
+              | union(_vm_with_dhclient | default([]))
+            ) 
+            | intersect(_precheck_ok | default([]))
+            | unique | sort 
+          }}
+
 
     - name: Compute totals
       ansible.builtin.set_fact:
