@@ -1,0 +1,28 @@
+---
+- name: Check dhclient file exists
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: dhf
+
+- name: Comment out all non-comment lines
+  when: dhf.stat.exists | default(false)
+  ansible.builtin.replace:
+    path: "{{ item }}"
+    regexp: '^(?!#)(.*)$'
+    replace: '#\1'
+    backup: true
+  register: r_dhclient
+
+- name: Mark dhclient change flag if file was modified
+  when:
+    - dhf.stat.exists | default(false)
+    - r_dhclient is defined
+    - r_dhclient.changed | default(false)
+  ansible.builtin.set_fact:
+    changed_dhclient: true
+
+- name: Get content (optional audit/debug)
+  when: dhf.stat.exists | default(false)
+  ansible.builtin.command: cat "{{ item }}"
+  register: modified_file
+  changed_when: false
