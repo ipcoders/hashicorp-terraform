@@ -193,24 +193,27 @@
               {{
                 host_resolv_data.dns_config 
                 | select('search', '^nameserver')
-                | map('replace', 'nameserver ', '') 
+                | map('regex_replace', '^nameserver\s+', '') 
+                | map('trim')
                 | list
               }}
+
+        - name: Compute resolv.conf compliance
+          when: host_resolv_data is defined
+          ansible.builtin.set_fact:
             resolv_compliant: >-
               {{
-                (host_resolv_data.dns_config 
-                  | select('search', '^nameserver')
-                  | map('replace', 'nameserver ', '') 
-                  | list)
-                == (valid_nameservers | sort)
+                (resolv_nameservers | sort) == (valid_nameservers | map('trim') | sort) 
               }}
 
         - name: Show resolv_result and resolv_result vars
           when: resolv_result is defined and resolv_result.stdout_lines is defined
           ansible.builtin.debug:
             msg:
-              resolv_nameservers: "{{ resolv_nameservers }}"
+              valid_nameservers: "{{ valid_nameservers }}"
               resolv_compliant: "{{ resolv_compliant }}"
+              valid_nameservers_sorted_json: "{{ (valid_nameservers | map('trim') | sort) | to_json }}"
+
 
         - name: Process noncompliant resolv.conf
           when: resolv_compliant is defined and (not resolv_compliant)
@@ -338,7 +341,9 @@
 
   tasks:
     - name: Device in a valid zone
-      when: ifcfg_data is defined and host_resolv_data
+      when: 
+        - ifcfg_data is defined
+        - host_resolv_data is defined
       block:
         - name: Set variables
           ansible.builtin.set_fact:
@@ -483,7 +488,6 @@
       when: 
         - hostvars[item].vm_ifcfg_summary is defined
         - hostvars[item].vm_ifcfg_summary | length > 0
-        - (hostvars[item].vm_ifcfg_summary | first).msg != 'valid'
         - ((hostvars[item].vm_ifcfg_summary | first).ifcfg_is | default('')) == 'invalid'
         - (hostvars[item].vm_ifcfg_summary | first).change_plan.data.change_required is defined
         - (hostvars[item].vm_ifcfg_summary | first).change_plan.data.change_required | default(false)
@@ -563,10 +567,14 @@
           | selectattr('msg', 'defined')
           | selectattr('msg', 'equalto', 'valid')
           | map(attribute='host') | list | unique | sort }}"
+        
+        # _valid_vm: "{{ (_rows_ifcfg | selectattr('msg', 'defined') | selectattr('msg', 'equalto', 'valid') | map(attribute='host') | list | sort) }}"
 
         _invalid_zone: "{{ (_rows_ifcfg | selectattr('msg', 'defined') | selectattr('msg', 'equalto', 'invalid_zone') | map(attribute='host') | list | sort) }}"
 
         _unreachable_vm: "{{ (_rows_ifcfg | selectattr('msg', 'defined') | selectattr('msg', 'equalto', 'unreachable_vm') | map(attribute='host') | list | sort) }}"
+
+        # _invalid_vm: "{{ (_rows_ifcfg | selectattr('msg', 'defined') | selectattr('msg', 'ne', 'valid') | map(attribute='host') | list | sort) }"
 
         _invalid_nics: "{{ (_rows_ifcfg | selectattr('msg', 'equalto', 'invalid_nics') | map(attribute='host') | list | sort) }}"
 
