@@ -26,3 +26,4 @@
   ansible.builtin.command: cat "{{ item }}"
   register: modified_file
   changed_when: false
+
