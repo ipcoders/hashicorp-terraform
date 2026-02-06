@@ -1,6 +1,13 @@
 ---
-- name: Remediation Play (parity with dry-run, production-safe)
+# =====================================================================
+# Remediation Playbook
+# - Play 1: IDENTIFY (copy of dryrun Play 1 logic for parity)
+# - Play 2: REMEDIATE (ifcfg + dhclient only, no resolv.conf edits)
+# =====================================================================
+
+- name: Remediation - Identify (parity with dryrun)
   hosts: all
+  serial: 1
   become: true
   become_user: root
   gather_facts: no
@@ -13,22 +20,25 @@
         ifcfg_dir: "/etc/sysconfig/network-scripts"
 
         inventory_zone_found: false
+        profile_found: false
+
+        # IMPORTANT: initialize BOTH summaries
         vm_ifcfg_summary: []
-        vm_resolv_summary: []     # IMPORTANT: ensure always initialized
+        vm_resolv_summary: []
+
         dns_configs: []
         all_dhclient_files: []
         disable_dhclient: false
 
-        # Expected resolvers (same as dry-run)
+        # Track in-scope explicitly for Play 2 gating
+        in_scope: false
+
+        # Expected resolvers (same variable name as dryrun)
         valid_nameservers: ["1.1.1.1", "2.2.2.2"]
 
-        # Safety: do NOT reboot unless explicitly enabled
-        allow_reboot: false
-
-        # Change tracking flags
-        did_change_ifcfg: false
-        did_change_resolv: false
-        did_disable_dhclient: false
+        # Change tracking (used in Play 2)
+        changed_ifcfg: false
+        changed_dhclient: false
 
     - name: Reachability check
       ansible.builtin.wait_for_connection:
@@ -37,7 +47,7 @@
       ignore_unreachable: true
       failed_when: false
 
-    - name: Stop host if unreachable/auth failed
+    - name: Block unreachable/auth failed
       when:
         - wfc is defined and wfc.msg is defined
         - (wfc.msg | regex_search('timed out|time out|failed to connect|unreachable|connection refused|permission denied', ignorecase=True))
@@ -46,20 +56,21 @@
           ansible.builtin.debug:
             msg: "The '{{ inventory_hostname }}' VM is unreachable or authentication failed."
 
-        - name: Record unreachable host
+        - name: Write failed hosts lists
           ansible.builtin.set_fact:
+            in_scope: false
             vm_ifcfg_summary: "{{ vm_ifcfg_summary + [{'host': inventory_hostname, 'msg': 'unreachable_vm'}] }}"
 
         - meta: end_host
 
-    - name: Include DNS variables (profile)
+    - name: Include DNS variables
       ansible.builtin.include_vars:
         file: "{{ ifcfg_profile }}"
         name: dns_profile
       delegate_to: localhost
       become: false
 
-    - name: Stop host if profile missing
+    - name: Error handling
       when: dns_profile is undefined
       block:
         - name: Error message
@@ -73,7 +84,7 @@
         path: "{{ ifcfg_dir }}"
       register: result
 
-    - name: Find all ifcfg files (for artifact/debug parity)
+    - name: Find all ifcfg files
       when: result is defined and result.stat.isdir | default(false)
       ansible.builtin.find:
         paths: "{{ ifcfg_dir }}"
@@ -86,7 +97,7 @@
       ansible.builtin.set_fact:
         all_ifcfg_files: "{{ (all_ifcfg.files | default([])) | map(attribute='path') | list }}"
 
-    - name: Find only active ifcfg files (exclude lo/backups)
+    - name: Find only ifcfg files (exclude lo/backups)
       when: result is defined and result.stat.isdir | default(false)
       ansible.builtin.find:
         paths: "{{ ifcfg_dir }}"
@@ -99,11 +110,11 @@
         use_regex: true
       register: found_ifcfg
 
-    - name: Save list of active ifcfg files (paths)
+    - name: Save list of ifcfg files (paths)
       ansible.builtin.set_fact:
         ifcfg_files: "{{ (found_ifcfg.files | default([])) | map(attribute='path') | list }}"
 
-    - name: Stop host if invalid number of NICs
+    - name: Invalid number of network interfaces
       when: ifcfg_files | length != 1
       block:
         - name: Device will be skipped
@@ -113,29 +124,37 @@
               - "INVALID number of network interfaces found"
               - "Interface counter: '{{ ifcfg_files | length }}'."
 
-        - name: Record invalid NICs host
+        - name: Write hosts lists due to invalid number of NICs
           ansible.builtin.set_fact:
+            in_scope: false
             vm_ifcfg_summary: "{{ vm_ifcfg_summary + [{'host': inventory_hostname, 'msg': 'invalid_nics'}] }}"
 
         - meta: end_host
 
-    - name: Set inventory zone and validate
+    - name: Extra check to stop if multiple interfaces are found
+      when: ifcfg_files | length != 1
+      ansible.builtin.fail:
+        msg:
+          - "Emergency stop, invalid number of interfaces found"
+          - "Interfaces {{ ifcfg_files }}"
+
+    - name: Set inventory zone
       block:
-        - name: Extract zone from hostname
+        - name: Set inventory zone
           ansible.builtin.set_fact:
             zone: "{{ inventory_hostname | regex_search('^[^.]+\\.([^.]{2})\\.', '\\1') | join('') }}"
 
-        - name: Get inventory zones from env
+        - name: Get inventory zones
           ansible.builtin.set_fact:
             inventory_zones: "{{ lookup('ansible.builtin.env', 'INVENTORY_ZONES') | split(' ') }}"
 
-        - name: Mark zone valid if in allowed zones
+        - name: Zone was found and is valid
           when: zone in inventory_zones
           ansible.builtin.set_fact:
             inventory_zone_found: true
 
-        - name: Stop host if invalid zone
-          when: not inventory_zone_found
+        - name: Invalid zone
+          when: inventory_zone_found == false
           block:
             - name: Device will be skipped
               ansible.builtin.debug:
@@ -144,21 +163,27 @@
                   - "Either the zone was not found or is invalid."
                   - "Zone found was: '{{ zone }}'."
 
-            - name: Record invalid zone host
+            - name: Write failed hosts lists due to zone mismatch
               ansible.builtin.set_fact:
+                in_scope: false
                 vm_ifcfg_summary: "{{ vm_ifcfg_summary + [{'host': inventory_hostname, 'msg': 'invalid_zone'}] }}"
 
             - meta: end_host
 
-    - name: Read resolv.conf (in-scope)
+        - name: Mark host in-scope (passed gates)
+          when: inventory_zone_found
+          ansible.builtin.set_fact:
+            in_scope: true
+
+    - name: Process resolv configuration file (detection only)
       when: inventory_zone_found
       block:
-        - name: Cat resolv.conf
+        - name: Check resolv.conf
           ansible.builtin.command: "cat {{ resolv_conf_path }}"
           changed_when: false
           register: resolv_result
 
-        - name: Set resolv vars
+        - name: Set vars
           when: resolv_result is defined and resolv_result.stdout_lines is defined
           ansible.builtin.set_fact:
             host_resolv_data:
@@ -166,27 +191,27 @@
               dns_config: "{{ resolv_result.stdout_lines }}"
               raw_config: "{{ resolv_result.stdout }}"
 
-        # Gotcha A fix: canonical parsing + sort both sides
-        - name: Compute resolv.conf compliance (canonical)
+        - name: Compute resolv.conf nameserver list (same logic as dryrun)
           when: host_resolv_data is defined
           ansible.builtin.set_fact:
-            resolv_nameservers_raw: >-
+            resolv_nameservers: >-
               {{
                 host_resolv_data.dns_config
                 | select('search', '^nameserver')
-                | map('regex_replace', '^nameserver\\s+', '')
+                | map('regex_replace', '^nameserver\s+', '')
                 | map('trim')
                 | list
               }}
-            resolv_nameservers: "{{ resolv_nameservers_raw | sort }}"
+
+        - name: Compute resolv.conf compliance (same logic as dryrun)
+          when: host_resolv_data is defined
+          ansible.builtin.set_fact:
             resolv_compliant: >-
               {{
-                (resolv_nameservers_raw | sort)
-                ==
-                (valid_nameservers | map('trim') | sort)
+                (resolv_nameservers | sort) == (valid_nameservers | map('trim') | sort)
               }}
 
-        - name: If resolv non-compliant, find dhclient overrides
+        - name: Process noncompliant resolv.conf
           when: resolv_compliant is defined and (not resolv_compliant)
           block:
             - name: Find dhclient files globally
@@ -202,7 +227,7 @@
                 file_type: file
               register: global_dhclient_files
 
-            - name: Mark dhclient disable required if files found
+            - name: dhclient files were found
               when:
                 - global_dhclient_files is defined
                 - global_dhclient_files.matched | int > 0
@@ -210,7 +235,7 @@
                 disable_dhclient: true
                 all_dhclient_files: "{{ all_dhclient_files + (global_dhclient_files.files | map(attribute='path') | list | flatten) }}"
 
-            - name: Append resolv summary (invalid)
+            - name: Append non-compliant resolv.conf summary
               ansible.builtin.set_fact:
                 vm_resolv_summary: >-
                   {{
@@ -218,13 +243,13 @@
                     + [{
                       'host': inventory_hostname,
                       'msg': 'invalid',
-                      'nameservers': (resolv_nameservers | default([])),
-                      'disable_dhclient': (disable_dhclient | default(false)),
+                      'nameservers': resolv_nameservers | default([]),
+                      'disable_dhclient': disable_dhclient,
                       'all_dhclient_files': (all_dhclient_files | default([]))
                     }]
                   }}
 
-        - name: Append resolv summary (valid)
+        - name: Append compliant resolv.conf summary
           when: resolv_compliant is defined and resolv_compliant
           ansible.builtin.set_fact:
             vm_resolv_summary: >-
@@ -234,20 +259,20 @@
                   'host': inventory_hostname,
                   'msg': 'valid',
                   'nameservers': (resolv_nameservers | default([])),
-                  'disable_dhclient': (disable_dhclient | default(false)),
+                  'disable_dhclient': disable_dhclient,
                   'all_dhclient_files': (all_dhclient_files | default([]))
                 }]
               }}
 
-    - name: Read and parse ifcfg (in-scope)
+    - name: Process ifcfg configuration file (detection only)
       when: inventory_zone_found
       block:
-        - name: Slurp ifcfg file
+        - name: Check ifcfg configuration
           ansible.builtin.slurp:
             src: "{{ ifcfg_files | first }}"
           register: ifcfg_raw
 
-        - name: Build parsed ifcfg structure
+        - name: Build parsed DNS structure from files
           ansible.builtin.set_fact:
             ifcfg_data: "{{ (ifcfg_data | default([])) + [parsed] }}"
           vars:
@@ -268,38 +293,37 @@
               nameservers: "{{ nameservers }}"
               domains: "{{ domains }}"
 
-        - name: Evaluate ifcfg compliance (same rule as dry-run)
-          when: ifcfg_data is defined
-          vars:
-            _want_peerdns: "{{ dns_profile['ifcfg']['peerdns'] | lower }}"
-            _want_boot: "{{ dns_profile['ifcfg']['bootproto'] | lower }}"
-          ansible.builtin.set_fact:
-            ifcfg_overall_changes: >-
-              {{
-                (ifcfg_overall_changes | default([]))
-                + [{
-                    'interface': item.path,
-                    'change_required': (
-                      (item.peerdns | default('', true) | lower) != _want_peerdns
-                      or
-                      (item.bootproto | default('', true) | lower) != _want_boot
-                      or
-                      ((item.nameservers | default([], true) | length) > 0)
-                    )
-                  }]
-              }}
-          loop: "{{ ifcfg_data }}"
-          loop_control:
-            label: "{{ item.path }}"
+    - name: Evaluate ifcfg configuration (same logic as dryrun)
+      when: ifcfg_data is defined
+      vars:
+        _want_peerdns: "{{ dns_profile['ifcfg']['peerdns'] | lower }}"
+        _want_boot: "{{ dns_profile['ifcfg']['bootproto'] | lower }}"
+      ansible.builtin.set_fact:
+        ifcfg_overall_changes: >-
+          {{
+            (ifcfg_overall_changes | default([]))
+            + [{
+                'interface': item.path,
+                'change_required': (
+                  (item.peerdns | default('', true) | lower) != _want_peerdns
+                  or
+                  (item.bootproto | default('', true) | lower) != _want_boot
+                  or
+                  ((item.nameservers | default([], true) | length) > 0)
+                )
+              }]
+          }}
+      loop: "{{ ifcfg_data }}"
+      loop_control:
+        label: "{{ item.path }}"
 
   tasks:
-    - name: Build config snapshots and change_plan (in-scope only)
+    - name: Build host change_plan + snapshots (same structure as dryrun)
       when:
-        - inventory_zone_found
         - ifcfg_data is defined
         - host_resolv_data is defined
       block:
-        - name: Set snapshot variables
+        - name: Set variables
           ansible.builtin.set_fact:
             resolv_config:
               data: "{{ host_resolv_data.raw_config }}"
@@ -311,240 +335,174 @@
               host: "{{ inventory_hostname }}"
               data: {}
 
-        - name: Attach first required change (if any) to change_plan
-          when:
-            - ifcfg_overall_changes is defined
-            - (ifcfg_overall_changes | selectattr('change_required') | list | length) > 0
-          ansible.builtin.set_fact:
-            change_plan: "{{ change_plan | combine({'data': (ifcfg_overall_changes | first) }) }}"
-
-    - name: Write per-host ifcfg summary (parity with dry-run)
+    - name: Check IFCFG and populate change_plan (same logic as dryrun)
       when:
-        - inventory_zone_found
         - change_plan is defined
-      block:
-        - name: ifcfg requires change
-          when:
-            - ifcfg_overall_changes is defined
-            - (ifcfg_overall_changes | selectattr('change_required') | list | length) > 0
-            - change_plan.data.change_required | default(false)
-          ansible.builtin.set_fact:
-            vm_ifcfg_summary: >-
-              {{
-                (vm_ifcfg_summary | default([]))
-                + [{
-                  'host': inventory_hostname,
-                  'msg': 'valid',
-                  'ifcfg_is': 'invalid',
-                  'change_plan': change_plan
-                }]
-              }}
+        - ifcfg_overall_changes is defined
+        - (ifcfg_overall_changes | selectattr('change_required') | list | length) > 0
+      ansible.builtin.set_fact:
+        change_plan: >-
+          {{
+            change_plan | combine({'data': (ifcfg_overall_changes | first) })
+          }}
 
-        - name: ifcfg does not require change
-          when: (change_plan.data | default({})) | length == 0
-          ansible.builtin.set_fact:
-            vm_ifcfg_summary: >-
-              {{
-                (vm_ifcfg_summary | default([]))
-                + [{
-                  'host': inventory_hostname,
-                  'msg': 'valid',
-                  'ifcfg_is': 'valid',
-                  'change_plan': change_plan
-                }]
-              }}
-
-    - name: Build final_summary + decision flags (single source of truth)
-      when: inventory_zone_found
-      block:
-        - name: Set final summary
-          ansible.builtin.set_fact:
-            final_summary:
-              vm: "{{ inventory_hostname }}"
-              ifcfg: "{{ vm_ifcfg_summary | default([]) }}"
-              resolv: "{{ vm_resolv_summary | default([]) }}"
-
-        - name: Compute remediation decision flags
-          ansible.builtin.set_fact:
-            ifcfg_invalid: "{{ ((final_summary.ifcfg | default([])) | first).ifcfg_is | default('') == 'invalid' }}"
-            resolv_invalid: "{{ ((final_summary.resolv | default([])) | first).msg | default('') == 'invalid' }}"
-            dhclient_present: "{{ (((final_summary.resolv | default([])) | first).disable_dhclient | default(false)) | bool }}"
-            in_scope_ok: "{{ ((final_summary.ifcfg | default([])) | length > 0) and ((final_summary.resolv | default([])) | length > 0) }}"
-
-        - name: Safety assert - must have summaries before any change
-          ansible.builtin.assert:
-            that:
-              - in_scope_ok
-            fail_msg: "Safety stop: missing compliance summaries (ifcfg/resolv). Will not remediate."
-
-    # ----------------------------
-    # APPLY CHANGES (SAFE & GUARDED)
-    # ----------------------------
-
-    - name: Disable dhclient override files (only when present)
+  post_tasks:
+    - name: ifcfg requires change
       when:
-        - inventory_zone_found
-        - dhclient_present
-        - ((final_summary.resolv | first).all_dhclient_files | default([])) | length > 0
-      block:
-        - name: Disable dhclient file by renaming to .disabled (idempotent)
-          ansible.builtin.command: "mv '{{ item }}' '{{ item }}.disabled'"
-          args:
-            removes: "{{ item }}"
-            creates: "{{ item }}.disabled"
-          register: mv_dhclient
-          changed_when: mv_dhclient.rc == 0
-          loop: "{{ (final_summary.resolv | first).all_dhclient_files }}"
-          loop_control:
-            label: "{{ item }}"
-          when: not (item | regex_search('\\.disabled$'))
+        - change_plan is defined and ifcfg_overall_changes is defined
+        - (ifcfg_overall_changes | selectattr('change_required') | list | length) > 0
+        - change_plan['data']['change_required']
+      ansible.builtin.set_fact:
+        vm_ifcfg_summary: >-
+          {{
+            (vm_ifcfg_summary | default([]))
+            + [{
+              'host': inventory_hostname,
+              'msg': 'valid',
+              'ifcfg_is': 'invalid',
+              'change_plan': change_plan
+            }]
+          }}
 
-        - name: Mark dhclient disable change flag if any rename happened
-          ansible.builtin.set_fact:
-            did_disable_dhclient: true
-          when: >
-            (mv_dhclient is defined)
-            and (mv_dhclient.results is defined)
-            and ((mv_dhclient.results | selectattr('changed', 'equalto', true) | list | length) > 0)
+    - name: ifcfg does not require change
+      when: change_plan is defined and change_plan['data'] | length == 0
+      ansible.builtin.set_fact:
+        vm_ifcfg_summary: >-
+          {{
+            (vm_ifcfg_summary | default([]))
+            + [{
+              'host': inventory_hostname,
+              'msg': 'valid',
+              'ifcfg_is': 'valid',
+              'change_plan': change_plan
+            }]
+          }}
 
-    - name: Remediate ifcfg (only when non-compliant)
+
+# =====================================================================
+# PLAY 2: REMEDIATE
+# - Only ifcfg + dhclient
+# - No resolv.conf writes
+# - Reboot only if any change made
+# =====================================================================
+
+- name: Remediation - Apply (ifcfg + dhclient only)
+  hosts: all
+  serial: 1
+  become: true
+  become_user: root
+  gather_facts: no
+
+  tasks:
+    - name: Safety: skip out-of-scope hosts
+      when: not (in_scope | default(false) | bool)
+      ansible.builtin.debug:
+        msg: "Skipping {{ inventory_hostname }} (out-of-scope)."
+
+    - name: Safety assert: must have summaries for in-scope hosts
+      when: (in_scope | default(false) | bool)
+      ansible.builtin.assert:
+        that:
+          - vm_ifcfg_summary is defined
+          - (vm_ifcfg_summary | length) > 0
+          - vm_resolv_summary is defined
+          - (vm_resolv_summary | length) > 0
+        fail_msg: "Safety stop: missing compliance summaries on an in-scope host. Will not remediate."
+
+    - name: Compute remediation flags
+      when: (in_scope | default(false) | bool)
+      ansible.builtin.set_fact:
+        _ifcfg_invalid: "{{ ((vm_ifcfg_summary | first).ifcfg_is | default('')) == 'invalid' }}"
+        _dhclient_present: "{{ ((vm_resolv_summary | first).disable_dhclient | default(false)) | bool }}"
+        _dhclient_files: "{{ (vm_resolv_summary | first).all_dhclient_files | default([]) }}"
+        _ifcfg_path: "{{ (ifcfg_config.path | default(ifcfg_files | first)) }}"
+        _want_boot: "{{ dns_profile['ifcfg']['bootproto'] }}"
+        _want_peerdns: "{{ dns_profile['ifcfg']['peerdns'] }}"
+
+    # ---------------------------
+    # Disable dhclient overrides (comment out)
+    # ---------------------------
+    - name: Comment out dhclient override files (only if present)
       when:
-        - inventory_zone_found
-        - ifcfg_invalid
-      block:
-        - name: Ensure BOOTPROTO matches profile
-          ansible.builtin.lineinfile:
-            path: "{{ ifcfg_files | first }}"
-            regexp: '^BOOTPROTO='
-            line: "BOOTPROTO={{ dns_profile['ifcfg']['bootproto'] }}"
-            create: false
-            backrefs: false
-          register: ifcfg_bootproto
+        - (in_scope | default(false) | bool)
+        - _dhclient_present
+        - (_dhclient_files | length) > 0
+      ansible.builtin.include_tasks: disable_dhclient.yml
+      loop: "{{ _dhclient_files }}"
+      loop_control:
+        label: "{{ item }}"
 
-        - name: Ensure PEERDNS matches profile
-          ansible.builtin.lineinfile:
-            path: "{{ ifcfg_files | first }}"
-            regexp: '^PEERDNS='
-            line: "PEERDNS={{ dns_profile['ifcfg']['peerdns'] }}"
-            create: false
-            backrefs: false
-          register: ifcfg_peerdns
-
-        - name: Remove any DNSx entries (DNS1=, DNS2=, ...)
-          ansible.builtin.lineinfile:
-            path: "{{ ifcfg_files | first }}"
-            regexp: '^DNS[0-9]+='
-            state: absent
-          register: ifcfg_dnsx
-
-        - name: Mark ifcfg change flag if any ifcfg edit occurred
-          ansible.builtin.set_fact:
-            did_change_ifcfg: true
-          when: (ifcfg_bootproto.changed | bool) or (ifcfg_peerdns.changed | bool) or (ifcfg_dnsx.changed | bool)
-
-    - name: Remediate resolv.conf (only when resolv invalid and ifcfg is valid)
+    # ---------------------------
+    # Fix ifcfg (BOOTPROTO/PEERDNS + remove DNSx)
+    # ---------------------------
+    - name: Ensure BOOTPROTO matches profile (add if missing)
       when:
-        - inventory_zone_found
-        - resolv_invalid
-        - not ifcfg_invalid   # parity with your rule: ifcfg invalid => resolv irrelevant
-      block:
-        - name: Build desired resolv.conf content (preserve non-nameserver lines)
-          ansible.builtin.set_fact:
-            _resolv_existing_lines: "{{ host_resolv_data.dns_config | default([]) }}"
-            _resolv_non_ns_lines: >-
-              {{
-                (_resolv_existing_lines | default([]))
-                | reject('search', '^nameserver')
-                | list
-              }}
-            _resolv_desired_lines: >-
-              {{
-                (valid_nameservers | map('trim') | list)
-                | map('regex_replace', '^(.*)$', 'nameserver \\1')
-                | list
-              }}
-            _resolv_new_content: >-
-              {{
-                (_resolv_desired_lines + _resolv_non_ns_lines)
-                | join('\n')
-                ~ '\n'
-              }}
+        - (in_scope | default(false) | bool)
+        - _ifcfg_invalid
+      ansible.builtin.lineinfile:
+        path: "{{ _ifcfg_path }}"
+        regexp: '^BOOTPROTO='
+        line: "BOOTPROTO={{ _want_boot }}"
+        insertafter: EOF
+        create: false
+        backup: true
+      register: r_bootproto
 
-        - name: Write resolv.conf if content differs
-          ansible.builtin.copy:
-            dest: "{{ resolv_conf_path }}"
-            content: "{{ _resolv_new_content }}"
-            owner: root
-            group: root
-            mode: "0644"
-            backup: true
-          register: resolv_copy
-
-        - name: Mark resolv change flag if changed
-          ansible.builtin.set_fact:
-            did_change_resolv: true
-          when: resolv_copy.changed | bool
-
-    # Restart only if something changed
-    - name: Collect service facts
+    - name: Ensure PEERDNS matches profile (add if missing)
       when:
-        - inventory_zone_found
-        - did_change_ifcfg or did_change_resolv or did_disable_dhclient
-      ansible.builtin.service_facts:
+        - (in_scope | default(false) | bool)
+        - _ifcfg_invalid
+      ansible.builtin.lineinfile:
+        path: "{{ _ifcfg_path }}"
+        regexp: '^PEERDNS='
+        line: "PEERDNS={{ _want_peerdns }}"
+        insertafter: EOF
+        create: false
+        backup: true
+      register: r_peerdns
 
-    - name: Restart appropriate network service (only if changes applied)
+    - name: Remove any DNSx entries (DNS1=, DNS2=, ...)
       when:
-        - inventory_zone_found
-        - did_change_ifcfg or did_change_resolv or did_disable_dhclient
-      block:
-        - name: Restart NetworkManager if present
-          when: ansible_facts.services is defined and ('NetworkManager.service' in ansible_facts.services)
-          ansible.builtin.service:
-            name: NetworkManager
-            state: restarted
+        - (in_scope | default(false) | bool)
+        - _ifcfg_invalid
+      ansible.builtin.lineinfile:
+        path: "{{ _ifcfg_path }}"
+        regexp: '^DNS[0-9]+='
+        state: absent
+        backup: true
+      register: r_dnsx
 
-        - name: Restart network service if present (fallback)
-          when:
-            - ansible_facts.services is defined
-            - ('NetworkManager.service' not in ansible_facts.services)
-            - ('network.service' in ansible_facts.services)
-          ansible.builtin.service:
-            name: network
-            state: restarted
+    - name: Set change flags (ifcfg)
+      when: (in_scope | default(false) | bool)
+      ansible.builtin.set_fact:
+        changed_ifcfg: >-
+          {{
+            (r_bootproto is defined and (r_bootproto.changed | default(false)))
+            or (r_peerdns is defined and (r_peerdns.changed | default(false)))
+            or (r_dnsx is defined and (r_dnsx.changed | default(false)))
+          }}
 
-        - name: No known network service found (safety message)
-          when:
-            - ansible_facts.services is not defined
-              or (
-                ('NetworkManager.service' not in ansible_facts.services)
-                and ('network.service' not in ansible_facts.services)
-              )
-          ansible.builtin.debug:
-            msg:
-              - "WARNING: No NetworkManager.service or network.service detected."
-              - "Changes were applied but no service restart was performed for safety."
-              - "Host: {{ inventory_hostname }}"
+    # changed_dhclient is set inside disable_dhclient.yml via set_fact
+    - name: Determine if any change was made
+      when: (in_scope | default(false) | bool)
+      ansible.builtin.set_fact:
+        _any_change: "{{ (changed_ifcfg | default(false)) or (changed_dhclient | default(false)) }}"
 
-    - name: Optional reboot (disabled by default)
+    - name: Show action decision
+      when: (in_scope | default(false) | bool)
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          ifcfg_invalid: "{{ _ifcfg_invalid }}"
+          dhclient_present: "{{ _dhclient_present }}"
+          changed_ifcfg: "{{ changed_ifcfg | default(false) }}"
+          changed_dhclient: "{{ changed_dhclient | default(false) }}"
+          reboot: "{{ _any_change }}"
+
+    - name: Reboot only when a change has been made
       when:
-        - inventory_zone_found
-        - allow_reboot | bool
-        - did_change_ifcfg or did_change_resolv or did_disable_dhclient
+        - (in_scope | default(false) | bool)
+        - _any_change
       ansible.builtin.reboot:
         reboot_timeout: 600
         test_command: "true"
-
-  post_tasks:
-    - name: Show final summary + decisions
-      when: inventory_zone_found
-      ansible.builtin.debug:
-        msg:
-          final_summary: "{{ final_summary }}"
-          decisions:
-            ifcfg_invalid: "{{ ifcfg_invalid | default(false) }}"
-            resolv_invalid: "{{ resolv_invalid | default(false) }}"
-            dhclient_present: "{{ dhclient_present | default(false) }}"
-            changes_applied:
-              did_change_ifcfg: "{{ did_change_ifcfg | default(false) }}"
-              did_change_resolv: "{{ did_change_resolv | default(false) }}"
-              did_disable_dhclient: "{{ did_disable_dhclient | default(false) }}"
