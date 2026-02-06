@@ -420,8 +420,15 @@
         _dhclient_present: "{{ ((vm_resolv_summary | first).disable_dhclient | default(false)) | bool }}"
         _dhclient_files: "{{ (vm_resolv_summary | first).all_dhclient_files | default([]) }}"
         _ifcfg_path: "{{ ifcfg_config.path | default('') }}"
-        _want_boot: "{{ dns_profile['ifcfg']['bootproto'] }}"
-        _want_peerdns: "{{ dns_profile['ifcfg']['peerdns'] }}"
+        _want_peerdns: >-
+          {{ 
+            (dns_profile['ifcfg']['peerdns'] is boolean)
+            | ternary(
+                (dns_profile['ifcfg']['peerdns'] | bool) | ternary('yes', 'no'),
+                dns_profile['ifcfg']['peerdns'] | string | lower
+              )
+          }}
+        _want_boot: "{{ dns_profile['ifcfg']['bootproto'] | string | lower }}"
 
     - name: Safety assert - ifcfg path must exist when remediation may touch it
       when:
@@ -461,8 +468,8 @@
           _dhclient_present: "{{ ((vm_resolv_summary | first).disable_dhclient | default(false)) | bool }}"
           _dhclient_files: "{{ (vm_resolv_summary | first).all_dhclient_files | default([]) }}"
           _ifcfg_path: "{{ ifcfg_config.path | default('') }}"
-          _want_boot: "{{ dns_profile['ifcfg']['bootproto'] }}"
-          _want_peerdns: "{{ dns_profile['ifcfg']['peerdns'] }}"
+          _want_boot: "{{ _want_boot }}"
+          _want_peerdns: "{{ _want_peerdns }}"
 
     # ---------------------------
     # Disable dhclient overrides (comment out)
