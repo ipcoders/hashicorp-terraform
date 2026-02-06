@@ -6,8 +6,8 @@
 # =====================================================================
 
 - name: Remediation - Identify (parity with dryrun)
-  hosts: all
-  serial: 1
+  hosts: apps59665.sb.mgicint.net
+  # serial: 1
   become: true
   become_user: root
   gather_facts: no
@@ -34,7 +34,7 @@
         in_scope: false
 
         # Expected resolvers (same variable name as dryrun)
-        valid_nameservers: ["1.1.1.1", "2.2.2.2"]
+        valid_nameservers: ["172.16.65.186", "172.16.65.187"]
 
         # Change tracking (used in Play 2)
         changed_ifcfg: false
@@ -296,8 +296,15 @@
     - name: Evaluate ifcfg configuration (same logic as dryrun)
       when: ifcfg_data is defined
       vars:
-        _want_peerdns: "{{ dns_profile['ifcfg']['peerdns'] | lower }}"
-        _want_boot: "{{ dns_profile['ifcfg']['bootproto'] | lower }}"
+        _want_peerdns: >-
+          {{ 
+            (dns_profile['ifcfg']['peerdns'] is boolean)
+            | ternary(
+                (dns_profile['ifcfg']['peerdns'] | bool) | ternary('yes', 'no'),
+                dns_profile['ifcfg']['peerdns'] | string | lower
+              )
+          }}
+        _want_boot: "{{ dns_profile['ifcfg']['bootproto'] | string | lower }}"
       ansible.builtin.set_fact:
         ifcfg_overall_changes: >-
           {{
@@ -384,19 +391,19 @@
 # =====================================================================
 
 - name: Remediation - Apply (ifcfg + dhclient only)
-  hosts: all
-  serial: 1
+  hosts: apps59665.sb.mgicint.net
+  # serial: 1
   become: true
   become_user: root
   gather_facts: no
 
   tasks:
-    - name: Safety: skip out-of-scope hosts
+    - name: Safety - skip out-of-scope hosts
       when: not (in_scope | default(false) | bool)
       ansible.builtin.debug:
         msg: "Skipping {{ inventory_hostname }} (out-of-scope)."
 
-    - name: Safety assert: must have summaries for in-scope hosts
+    - name: Safety assert - must have summaries for in-scope hosts
       when: (in_scope | default(false) | bool)
       ansible.builtin.assert:
         that:
@@ -416,7 +423,7 @@
         _want_boot: "{{ dns_profile['ifcfg']['bootproto'] }}"
         _want_peerdns: "{{ dns_profile['ifcfg']['peerdns'] }}"
 
-    - name: Safety assert: ifcfg path must exist when remediation may touch it
+    - name: Safety assert - ifcfg path must exist when remediation may touch it
       when:
         - (in_scope | default(false) | bool)
         - _ifcfg_invalid
@@ -426,7 +433,7 @@
           - _ifcfg_path | length > 0
         fail_msg: "Safety stop: ifcfg path is undefined/empty on a host that requires ifcfg remediation."
 
-    - name: Safety: stat ifcfg file
+    - name: Safety - stat ifcfg file
       when:
         - (in_scope | default(false) | bool)
         - _ifcfg_invalid
@@ -434,7 +441,7 @@
         path: "{{ _ifcfg_path }}"
       register: st_ifcfg
 
-    - name: Safety assert: ifcfg file must exist before editing
+    - name: Safety assert - ifcfg file must exist before editing
       when:
         - (in_scope | default(false) | bool)
         - _ifcfg_invalid
@@ -444,6 +451,19 @@
           - st_ifcfg.stat.isreg | default(false)
         fail_msg: "Safety stop: ifcfg file does not exist or is not a regular file."
 
+    - name: Show summary
+      when:
+        - (in_scope | default(false) | bool)
+        - _ifcfg_invalid
+      ansible.builtin.debug:
+        msg:
+          _ifcfg_invalid: "{{ ((vm_ifcfg_summary | first).ifcfg_is | default('')) == 'invalid' }}"
+          _dhclient_present: "{{ ((vm_resolv_summary | first).disable_dhclient | default(false)) | bool }}"
+          _dhclient_files: "{{ (vm_resolv_summary | first).all_dhclient_files | default([]) }}"
+          _ifcfg_path: "{{ ifcfg_config.path | default('') }}"
+          _want_boot: "{{ dns_profile['ifcfg']['bootproto'] }}"
+          _want_peerdns: "{{ dns_profile['ifcfg']['peerdns'] }}"
+
     # ---------------------------
     # Disable dhclient overrides (comment out)
     # ---------------------------
@@ -452,10 +472,16 @@
         - (in_scope | default(false) | bool)
         - _dhclient_present
         - (_dhclient_files | length) > 0
-      ansible.builtin.include_tasks: disable_dhclient.yml
-      loop: "{{ _dhclient_files }}"
-      loop_control:
-        label: "{{ item }}"
+      block:
+        - name: User message
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }} - Running disable_dhclient.yml"
+
+        - name: Include task - disable_dhclient.yml
+          ansible.builtin.include_tasks: disable_dhclient.yml
+          loop: "{{ _dhclient_files }}"
+          loop_control:
+            label: "{{ item }}"
 
     # ---------------------------
     # Fix ifcfg (BOOTPROTO/PEERDNS + remove DNSx)
@@ -486,7 +512,7 @@
         backup: true
       register: r_peerdns
 
-    - name: Remove any DNSx entries (DNS1=, DNS2=, ...)
+    - name: Remove any DNSx entries
       when:
         - (in_scope | default(false) | bool)
         - _ifcfg_invalid
