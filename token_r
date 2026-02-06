@@ -424,4 +424,115 @@
         that:
           - _ifcfg_path is defined
           - _ifcfg_path | length > 0
-        fail_msg: "Safety stop: ifcfg path is undef_
+        fail_msg: "Safety stop: ifcfg path is undefined/empty on a host that requires ifcfg remediation."
+
+    - name: Safety: stat ifcfg file
+      when:
+        - (in_scope | default(false) | bool)
+        - _ifcfg_invalid
+      ansible.builtin.stat:
+        path: "{{ _ifcfg_path }}"
+      register: st_ifcfg
+
+    - name: Safety assert: ifcfg file must exist before editing
+      when:
+        - (in_scope | default(false) | bool)
+        - _ifcfg_invalid
+      ansible.builtin.assert:
+        that:
+          - st_ifcfg.stat.exists | default(false)
+          - st_ifcfg.stat.isreg | default(false)
+        fail_msg: "Safety stop: ifcfg file does not exist or is not a regular file."
+
+    # ---------------------------
+    # Disable dhclient overrides (comment out)
+    # ---------------------------
+    - name: Comment out dhclient override files (only if present)
+      when:
+        - (in_scope | default(false) | bool)
+        - _dhclient_present
+        - (_dhclient_files | length) > 0
+      ansible.builtin.include_tasks: disable_dhclient.yml
+      loop: "{{ _dhclient_files }}"
+      loop_control:
+        label: "{{ item }}"
+
+    # ---------------------------
+    # Fix ifcfg (BOOTPROTO/PEERDNS + remove DNSx)
+    # ---------------------------
+    - name: Ensure BOOTPROTO matches profile (add if missing)
+      when:
+        - (in_scope | default(false) | bool)
+        - _ifcfg_invalid
+      ansible.builtin.lineinfile:
+        path: "{{ _ifcfg_path }}"
+        regexp: '^BOOTPROTO='
+        line: "BOOTPROTO={{ _want_boot }}"
+        insertafter: EOF
+        create: true
+        backup: true
+      register: r_bootproto
+
+    - name: Ensure PEERDNS matches profile (add if missing)
+      when:
+        - (in_scope | default(false) | bool)
+        - _ifcfg_invalid
+      ansible.builtin.lineinfile:
+        path: "{{ _ifcfg_path }}"
+        regexp: '^PEERDNS='
+        line: "PEERDNS={{ _want_peerdns }}"
+        insertafter: EOF
+        create: true
+        backup: true
+      register: r_peerdns
+
+    - name: Remove any DNSx entries (DNS1=, DNS2=, ...)
+      when:
+        - (in_scope | default(false) | bool)
+        - _ifcfg_invalid
+      ansible.builtin.lineinfile:
+        path: "{{ _ifcfg_path }}"
+        regexp: '^DNS[0-9]+='
+        state: absent
+        backup: true
+      register: r_dnsx
+
+    - name: Set change flags (ifcfg)
+      when: (in_scope | default(false) | bool)
+      ansible.builtin.set_fact:
+        changed_ifcfg: >-
+          {{
+            (r_bootproto is defined and (r_bootproto.changed | default(false)))
+            or (r_peerdns is defined and (r_peerdns.changed | default(false)))
+            or (r_dnsx is defined and (r_dnsx.changed | default(false)))
+          }}
+
+    - name: Ensure changed_dhclient always has a boolean value
+      when: (in_scope | default(false) | bool)
+      ansible.builtin.set_fact:
+        changed_dhclient: "{{ changed_dhclient | default(false) | bool }}"
+
+    - name: Determine if any change was made
+      when: (in_scope | default(false) | bool)
+      ansible.builtin.set_fact:
+        _any_change: "{{ (changed_ifcfg | default(false)) or (changed_dhclient | default(false)) }}"
+
+    - name: Show action decision
+      when: (in_scope | default(false) | bool)
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          ifcfg_invalid: "{{ _ifcfg_invalid }}"
+          dhclient_present: "{{ _dhclient_present }}"
+          dhclient_files_count: "{{ _dhclient_files | length }}"
+          changed_ifcfg: "{{ changed_ifcfg | default(false) }}"
+          changed_dhclient: "{{ changed_dhclient | default(false) }}"
+          reboot: "{{ _any_change }}"
+
+    - name: Reboot only when a change has been made
+      when:
+        - (in_scope | default(false) | bool)
+        - _any_change
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+        test_command: "true"
