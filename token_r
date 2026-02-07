@@ -6,7 +6,7 @@
 # =====================================================================
 
 - name: Remediation - Identify (parity with dryrun)
-  hosts: apps59665.sb.mgicint.net
+  hosts: ""
   # serial: 1
   become: true
   become_user: root
@@ -34,7 +34,7 @@
         in_scope: false
 
         # Expected resolvers (same variable name as dryrun)
-        valid_nameservers: ["172.16.65.186", "172.16.65.187"]
+        valid_nameservers: []
 
         # Change tracking (used in Play 2)
         changed_ifcfg: false
@@ -295,16 +295,12 @@
 
     - name: Evaluate ifcfg configuration (same logic as dryrun)
       when: ifcfg_data is defined
-      vars:
-        _want_peerdns: >-
-          {{ 
-            (dns_profile['ifcfg']['peerdns'] is boolean)
-            | ternary(
-                (dns_profile['ifcfg']['peerdns'] | bool) | ternary('yes', 'no'),
-                dns_profile['ifcfg']['peerdns'] | string | lower
-              )
-          }}
+      ansible.builtin.set_fact:
+        _want_peerdns: "{{ (dns_profile['ifcfg']['peerdns'] | bool) | ternary('yes', 'no') }}"
         _want_boot: "{{ dns_profile['ifcfg']['bootproto'] | string | lower }}"
+
+    - name: Evaluate ifcfg configuration (same logic as dryrun)
+      when: ifcfg_data is defined
       ansible.builtin.set_fact:
         ifcfg_overall_changes: >-
           {{
@@ -312,7 +308,7 @@
             + [{
                 'interface': item.path,
                 'change_required': (
-                  (item.peerdns | default('', true) | lower) != _want_peerdns
+                  (item.peerdns | default('', true) | lower) != (dns_profile['ifcfg']['peerdns'] | bool) | ternary('yes', 'no')
                   or
                   (item.bootproto | default('', true) | lower) != _want_boot
                   or
@@ -323,6 +319,14 @@
       loop: "{{ ifcfg_data }}"
       loop_control:
         label: "{{ item.path }}"
+
+    - name: Play 1
+      ansible.builtin.debug:
+        msg: 
+          - "Directly from dns_profile: {{ (dns_profile['ifcfg']['peerdns'] | bool) | ternary('yes', 'no') }}"
+          - "Content of dns_profile:"
+          - "{{ dns_profile }}"
+          - "_want_peerdns: {{ _want_peerdns }}"
 
   tasks:
     - name: Build host change_plan + snapshots (same structure as dryrun)
@@ -420,14 +424,7 @@
         _dhclient_present: "{{ ((vm_resolv_summary | first).disable_dhclient | default(false)) | bool }}"
         _dhclient_files: "{{ (vm_resolv_summary | first).all_dhclient_files | default([]) }}"
         _ifcfg_path: "{{ ifcfg_config.path | default('') }}"
-        _want_peerdns: >-
-          {{ 
-            (dns_profile['ifcfg']['peerdns'] is boolean)
-            | ternary(
-                (dns_profile['ifcfg']['peerdns'] | bool) | ternary('yes', 'no'),
-                dns_profile['ifcfg']['peerdns'] | string | lower
-              )
-          }}
+        _want_peerdns: "{{ (dns_profile['ifcfg']['peerdns'] | bool) | ternary('yes', 'no') }}"
         _want_boot: "{{ dns_profile['ifcfg']['bootproto'] | string | lower }}"
 
     - name: Safety assert - ifcfg path must exist when remediation may touch it
@@ -470,6 +467,7 @@
           _ifcfg_path: "{{ ifcfg_config.path | default('') }}"
           _want_boot: "{{ _want_boot }}"
           _want_peerdns: "{{ _want_peerdns }}"
+          _want_peerdns_type: "{{ _want_peerdns | type_debug }}"
 
     # ---------------------------
     # Disable dhclient overrides (comment out)
@@ -513,7 +511,7 @@
       ansible.builtin.lineinfile:
         path: "{{ _ifcfg_path }}"
         regexp: '^PEERDNS='
-        line: "PEERDNS={{ _want_peerdns }}"
+        line: "PEERDNS={{ (dns_profile['ifcfg']['peerdns'] | bool) | ternary('yes', 'no') }}"
         insertafter: EOF
         create: true
         backup: true
