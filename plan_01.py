@@ -1,199 +1,360 @@
 #!/usr/bin/env python3
 """
 ------------------------------------------------------------------------------
-Script: validate_requests.py
+Script: plan_requests.py
 ------------------------------------------------------------------------------
 
 Purpose
 ------------------------------------------------------------------------------
-This script validates and normalizes BlueCat change request YAML files before
-they enter later stages of the automation pipeline.
+This script performs the Plan stage for the BlueCat GitOps MVP.
 
-The script ensures that request files follow the expected schema and contain
-logically consistent operations. It performs structural validation and input
-normalization only.
+It reads normalized request data produced by the validation stage, queries the
+current BlueCat BAM state in read-only mode, and generates a plan describing
+what should happen next for each requested TXT change.
 
-Important:
-This script does NOT communicate with BlueCat and does NOT evaluate the
-current DNS state. Decisions such as create/skip/update/delete based on
-existing records are handled in later pipeline stages (Plan/Apply).
+This stage does NOT make any changes in BAM.
 
-The goal of this stage is to guarantee that user-provided YAML files are:
+Its job is to compare:
 
-    - structurally valid
-    - internally consistent
-    - normalized for downstream processing
+    desired state from normalized_requests.json
+
+against:
+
+    current BAM state
+
+and produce a deterministic action plan for downstream stages.
 
 
 ------------------------------------------------------------------------------
 Input
 ------------------------------------------------------------------------------
-The script accepts one or more request YAML files as positional arguments:
+The script expects a normalized validation artifact as input:
 
-    validate_requests.py requests/example.yml requests/test.yaml
+    out/normalized_requests.json
 
-Each file must:
+This file is produced by validate_requests.py and contains normalized request
+objects.
 
-    - exist on disk
-    - have extension .yml or .yaml
-    - contain valid YAML
+The current contract consumed by this script is:
 
+    {
+      "generated_at": "...",
+      "count": <n>,
+      "requests": [
+        {
+          "request_key": "...",
+          "user_email": "...",
+          "actions": [
+            {
+              "action": "create|update|delete",
+              "view": "internal",
+              "labels": [...],
+              "records": [
+                {
+                  "type": "txt",
+                  "zone": "...",
+                  "name": "...",
+                  "text": "...",
+                  "new_text": "..."
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
 
-------------------------------------------------------------------------------
-Data Model (TXT-only MVP)
-------------------------------------------------------------------------------
-
-Top-level structure:
-
-    user_email: required
-    actions: required (non-empty list)
-
-Action structure:
-
-    action: create | update | delete
-    view: optional, defaults to "internal"
-    labels: optional metadata list (defaults to [])
-    records: required (non-empty list)
-
-TXT record structure:
-
-    type: "txt"
-    zone: required string
-    name: required string
-    text: required string
-    new_text: required ONLY when action == update
-
-
-------------------------------------------------------------------------------
-Normalization Behavior
-------------------------------------------------------------------------------
-User input is normalized before being passed downstream.
-
-The script automatically:
-
-    - converts record type to lowercase ("TXT" -> "txt")
-    - converts action to lowercase
-    - converts view to lowercase
-    - trims whitespace from strings
-    - converts null labels to empty list []
-    - trims whitespace inside label values
-
-These transformations ensure that later pipeline stages operate on clean,
-consistent data.
+Only TXT records are planned in the current MVP.
 
 
 ------------------------------------------------------------------------------
-TXT Record Design (RRset-friendly)
+Output
 ------------------------------------------------------------------------------
-TXT records are treated as individual values within a DNS RRset.
+The script produces two artifacts:
 
-Each TXT value is uniquely identified by:
+1) out/plan.json
 
-    (view, zone, name, type, text)
+Machine-readable planning artifact containing:
 
-This allows multiple TXT values under the same name.
+    - generation timestamp
+    - planning counts
+    - one plan item per requested TXT record
+
+2) out/plan_report.md
+
+Human-readable report containing:
+
+    - generation timestamp
+    - summary counts
+    - failure details
+    - per-item planning results
+
+
+------------------------------------------------------------------------------
+External Dependencies
+------------------------------------------------------------------------------
+This stage requires access to BlueCat BAM through API v2.
+
+It authenticates using:
+
+    POST /api/v2/sessions
+
+and then performs read-only DNS lookups to determine whether requested TXT
+records already exist.
+
+Required environment variables:
+
+    BAM_BASE_URL
+    BAM_USER
+    BAM_PASS
+
+Optional planner behavior controls:
+
+    PLAN_FAIL_ON_MISSING_ZONE
+    PLAN_FAIL_ON_AMBIGUOUS
+
+Defaults:
+
+    - missing zone -> FAIL
+    - ambiguous match -> FAIL
+
+
+------------------------------------------------------------------------------
+High-Level Flow
+------------------------------------------------------------------------------
+The script performs the following steps:
+
+1. Load normalized_requests.json
+2. Convert request entries into internal PlanItem objects
+3. Read BAM connection and planner configuration from environment variables
+4. Log in to BlueCat BAM
+5. For each TXT request item:
+       - verify the zone exists
+       - check current TXT record state in BAM
+       - decide whether to create, update, delete, skip, or fail
+6. Write plan.json
+7. Write plan_report.md
+8. Return non-zero exit code if any item results in FAIL
+
+
+------------------------------------------------------------------------------
+Planning Model (TXT-only MVP)
+------------------------------------------------------------------------------
+Each TXT request is handled as a single value, not as a full RRset.
+
+A TXT item is effectively identified by:
+
+    (view, zone, name, text)
+
+This allows RRset-friendly behavior where multiple TXT values can exist under
+the same owner name.
 
 Examples:
 
     _acme-challenge.example.com TXT "token1"
     _acme-challenge.example.com TXT "token2"
 
-These are treated as separate items.
-
-Operation semantics:
-
-Create:
-    adds a TXT value
-
-Delete:
-    removes a specific TXT value
-
-Update:
-    replaces a TXT value
-    (text -> new_text)
+These are treated as separate TXT items.
 
 
 ------------------------------------------------------------------------------
-Action Validation Rules
+Supported Actions
 ------------------------------------------------------------------------------
 
 CREATE
-    - text is required
-    - new_text MUST NOT be provided
+    Desired intent:
+        add a TXT value if it does not already exist
 
-UPDATE
-    - text is required (old value)
-    - new_text is required (replacement value)
+    Planning behavior:
+        - if exact TXT already exists -> SKIP
+        - otherwise -> CREATE
+
 
 DELETE
-    - text is required
-    - new_text MUST NOT be provided
+    Desired intent:
+        remove a specific TXT value
+
+    Planning behavior:
+        - if exact TXT exists -> DELETE
+        - otherwise -> SKIP
+
+
+UPDATE
+    Desired intent:
+        replace one TXT value with another
+
+    Semantics:
+        text     = old/current value
+        new_text = replacement value
+
+    Planning behavior:
+        - if old value does not exist -> SKIP
+        - if new value already exists -> SKIP
+        - otherwise -> UPDATE
+
+In practice, UPDATE represents a later delete-old/create-new style operation,
+but this script only plans it; it does not execute it.
 
 
 ------------------------------------------------------------------------------
-File-Level Consistency Checks
+Safety Rules
 ------------------------------------------------------------------------------
-The script prevents contradictory instructions within the same YAML file.
+This stage is intentionally conservative.
 
-Using the TXT item key:
+1) Missing zone
+   If the requested zone does not exist, the planner fails the item by default.
 
-    (view, zone, name, type, text)
+   Reason:
+   A record operation cannot succeed if the zone is missing.
 
-The following situations are blocked:
+2) Ambiguous exact matches
+   If more than one exact TXT record match is found where a single exact match
+   is expected, the planner fails the item by default.
 
-    - create AND delete of the same TXT value in one file
-    - update AND delete of the same TXT value in one file
-    - multiple updates of the same TXT value with different new_text
-    - exact duplicate instructions
+   Reason:
+   The planner should never guess between multiple possible targets.
 
-These checks prevent ambiguous or conflicting change requests.
+3) Unsupported action
+   Any action outside the supported MVP set results in FAIL.
 
-
-------------------------------------------------------------------------------
-Warnings
-------------------------------------------------------------------------------
-Some conditions are allowed but produce warnings.
-
-Example:
-
-    update where text == new_text
-
-This represents a no-op change and will later be skipped during the Plan
-stage, but the request is still considered valid.
+4) Non-TXT records
+   Non-TXT record types are ignored during build_plan_items() and are not part
+   of current MVP planning.
 
 
 ------------------------------------------------------------------------------
-Outputs
+Planner Outcomes
 ------------------------------------------------------------------------------
+Each requested TXT item receives one final planning result:
 
-1) normalized_requests.json
+CREATE
+    A new TXT value should be created.
 
-Machine-readable artifact containing normalized request objects.
+UPDATE
+    An existing TXT value should be replaced.
 
-Structure:
+DELETE
+    An existing TXT value should be removed.
 
-    {
-      "generated_at": "<UTC timestamp>",
-      "count": <number_of_requests>,
-      "requests": [...]
-    }
+SKIP
+    The request is valid, but no change is required.
 
-Each request entry contains:
+    Examples:
+        - CREATE requested but the TXT value already exists
+        - DELETE requested but the TXT value does not exist
+        - UPDATE requested but the replacement value already exists
+        - UPDATE requested but the old value does not exist
 
-    - request_key (original file path)
-    - user_email
-    - normalized actions
+    In these cases, the desired state is already satisfied or cannot be
+    changed safely without introducing redundant work.
+
+FAIL
+    The planner cannot safely determine a valid action.
+
+    Examples:
+        - the requested zone does not exist
+        - BAM returned ambiguous results
+        - an unexpected lookup error occurred
+        - authentication or configuration failed
+
+    FAIL indicates a real problem that must be investigated before changes
+    can proceed.
 
 
-2) validation_report.md
+Pipeline behavior:
 
-Human-readable validation report containing:
+    SKIP  -> pipeline continues normally
+    FAIL  -> pipeline exits with error (exit code 2)
 
-    - generation timestamp
-    - number of processed files
-    - validation errors
-    - warnings
-    - summary status
+
+------------------------------------------------------------------------------
+Plan Item Structure
+------------------------------------------------------------------------------
+Each plan item includes:
+
+    request_key
+        original request file path from validation stage
+
+    user_email
+        requester identity
+
+    labels
+        optional metadata copied from request action
+
+    view
+        DNS view
+
+    type
+        record type (TXT in MVP)
+
+    zone
+        DNS zone
+
+    name
+        relative record name within the zone
+
+    action
+        requested action from the YAML file
+
+    text
+        requested current/target TXT value
+
+    new_text
+        replacement TXT value for updates
+
+    planned
+        final planner decision:
+            create | update | delete | skip | fail
+
+    reason
+        human-readable explanation for the planner result
+
+    details
+        structured metadata such as:
+            - match counts
+            - record IDs
+            - lookup details
+
+    zone_id
+        resolved zone ID when lookup succeeds
+
+
+------------------------------------------------------------------------------
+BlueCat Adapter Design
+------------------------------------------------------------------------------
+The script is intentionally modular.
+
+The BlueCatDnsAdapter contains BAM-specific DNS lookup logic, while the
+Planner class contains generic planning rules.
+
+This separation makes it easier to extend later for additional object types,
+such as:
+
+    - A records
+    - CNAME records
+    - IPAM objects
+    - other BlueCat-managed resources
+
+Current MVP adapter methods:
+
+    zone_exists(view, zone)
+    txt_exact_match(view, zone, name, text)
+
+
+------------------------------------------------------------------------------
+Reports
+------------------------------------------------------------------------------
+plan_report.md is designed for human review.
+
+It contains:
+
+    - total number of plan items
+    - counts by outcome (create/update/delete/skip/fail)
+    - dedicated failure section
+    - per-item summary lines
+
+The report is intentionally concise so that CI users can quickly understand
+what the planner decided and why.
 
 
 ------------------------------------------------------------------------------
@@ -201,29 +362,34 @@ Exit Codes
 ------------------------------------------------------------------------------
 
 Exit 0
-    Validation successful (no errors)
+    Plan completed successfully and no item resulted in FAIL
 
 Exit 2
-    One or more validation errors detected
+    One or more of the following occurred:
+        - input file missing
+        - configuration error
+        - BAM login failure
+        - at least one plan item resulted in FAIL
 
 
 ------------------------------------------------------------------------------
 Design Philosophy
 ------------------------------------------------------------------------------
-This validator intentionally performs only schema validation and logical
-consistency checks.
+This stage is read-only and state-aware.
 
-It does NOT:
+Unlike validation, which is purely structural, this planner is responsible for
+consulting live BAM state and determining whether requested operations are:
 
-    - check whether DNS records already exist
-    - determine whether operations are necessary
-    - communicate with BlueCat APIs
+    - necessary
+    - redundant
+    - unsafe
+    - impossible
 
-Those responsibilities belong to later pipeline stages that have access
-to live infrastructure state.
+The planner is intentionally conservative:
+it prefers FAIL over guessing, and SKIP over creating unnecessary work.
 
-By keeping validation deterministic and state-independent, the pipeline
-remains predictable and easier to audit.
+This keeps the pipeline predictable, auditable, and safe for later Apply-stage
+automation.
 ------------------------------------------------------------------------------
 """
 
@@ -231,354 +397,592 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import requests
 
-import yaml
-from pydantic import BaseModel, EmailStr, Field, ValidationError, field_validator, model_validator
 
+# -----------------------------
+# Utilities
+# -----------------------------
 
 def now_iso() -> str:
-    """UTC timestamp for artifact metadata."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# -----------------------------
-# Models (TXT-only MVP)
-# -----------------------------
-
-RecordType = Literal["txt"]
-ActionType = Literal["create", "update", "delete"]
-
-
-class TXTRecord(BaseModel):
-    """
-    Represents a single TXT value under an owner name (NOT the entire RRset).
-
-    Fields:
-    - text: the current/target TXT value for create/delete, and "old" value for update.
-    - new_text: the replacement value for update.
-    """
-    type: RecordType = Field(..., description="Record type (MVP: txt)")
-    zone: str = Field(..., min_length=1, description="Zone name (e.g. auth.example.com)")
-    name: str = Field(..., min_length=1, description="Relative record name within the zone")
-    text: str = Field(..., min_length=1, description="TXT value (old/current for update, target for create/delete)")
-    new_text: Optional[str] = Field(None, description="Replacement TXT value (update only)")
-
-    @field_validator("type", mode="before")
-    @classmethod
-    def normalize_type(cls, v: Any) -> Any:
-        return v.strip().lower() if isinstance(v, str) else v
-
-    @field_validator("zone", "name", "text", "new_text", mode="before")
-    @classmethod
-    def strip_strings(cls, v: Any) -> Any:
-        return v.strip() if isinstance(v, str) else v
-
-
-class Action(BaseModel):
-    """
-    One group of operations (e.g., create multiple TXT values).
-    Labels are optional metadata that later stages may include in reports / change-control notes.
-    """
-    action: ActionType
-    records: List[TXTRecord] = Field(..., min_length=1)
-    view: str = Field(default="internal")
-    labels: List[str] = Field(default_factory=list)
-
-    @field_validator("action", mode="before")
-    @classmethod
-    def normalize_action(cls, v: Any) -> Any:
-        return v.strip().lower() if isinstance(v, str) else v
-
-    @field_validator("view", mode="before")
-    @classmethod
-    def normalize_view(cls, v: Any) -> Any:
-        if v is None:
-            return "internal"
-        return v.strip().lower() if isinstance(v, str) else v
-
-    @field_validator("labels", mode="before")
-    @classmethod
-    def normalize_labels(cls, v: Any) -> Any:
-        if v is None:
-            return []
-        return v
-
-    @field_validator("labels")
-    @classmethod
-    def validate_labels(cls, v: List[Any]) -> List[str]:
-        if not isinstance(v, list):
-            raise ValueError("labels must be a list of strings")
-        cleaned: List[str] = []
-        for item in v:
-            if not isinstance(item, str) or item.strip() == "":
-                raise ValueError("labels must contain only non-empty strings")
-            cleaned.append(item.strip())
-        return cleaned
-
-    @model_validator(mode="after")
-    def enforce_action_record_rules(self) -> "Action":
-        """
-        Enforce per-action requirements.
-
-        create:
-          - requires text (already required by model)
-          - new_text MUST NOT be provided
-
-        update:
-          - requires text (old/current)
-          - requires new_text (replacement)
-
-        delete:
-          - requires text
-          - new_text MUST NOT be provided
-        """
-        for idx, r in enumerate(self.records):
-            if self.action in ("create", "delete"):
-                if r.new_text is not None and r.new_text != "":
-                    raise ValueError(f"records[{idx}].new_text is not allowed for action: {self.action}")
-
-            if self.action == "update":
-                if r.new_text is None or r.new_text.strip() == "":
-                    raise ValueError(f"records[{idx}].new_text is required for action: update")
-
-        return self
-
-
-class RequestFile(BaseModel):
-    user_email: EmailStr
-    actions: List[Action] = Field(..., min_length=1)
-
-    @model_validator(mode="after")
-    def cross_checks(self) -> "RequestFile":
-        """
-        File-level checks to prevent contradictory instructions within the same YAML file.
-
-        TXT item key (RRset-friendly):
-          (view, zone, name, type, text)
-
-        We block:
-        - create and delete of the same item in the same file
-        - update and delete of the same item in the same file
-        - multiple updates for the same old value but with different new_text
-        - exact duplicates of the same instruction
-        """
-        created: set[Tuple[str, str, str, str, str]] = set()
-        deleted: set[Tuple[str, str, str, str, str]] = set()
-        updated_to: Dict[Tuple[str, str, str, str, str], str] = {}
-
-        seen_dupes: set = set()
-
-        for a in self.actions:
-            for r in a.records:
-                item_key = (a.view, r.zone, r.name, r.type, r.text)
-
-                dupe_key = (a.action, *item_key, r.new_text if isinstance(r.new_text, str) else None)
-                if dupe_key in seen_dupes:
-                    raise ValueError(f"Duplicate entry detected: {dupe_key}")
-                seen_dupes.add(dupe_key)
-
-                if a.action == "create":
-                    if item_key in deleted:
-                        raise ValueError(
-                            f"Conflicting intent: create and delete for the same TXT value in one file: {item_key}"
-                        )
-                    created.add(item_key)
-
-                elif a.action == "delete":
-                    if item_key in created:
-                        raise ValueError(
-                            f"Conflicting intent: create and delete for the same TXT value in one file: {item_key}"
-                        )
-                    if item_key in updated_to:
-                        raise ValueError(
-                            f"Conflicting intent: update and delete for the same TXT value in one file: {item_key}"
-                        )
-                    deleted.add(item_key)
-
-                elif a.action == "update":
-                    if item_key in deleted:
-                        raise ValueError(
-                            f"Conflicting intent: update and delete for the same TXT value in one file: {item_key}"
-                        )
-                    new_val = (r.new_text or "").strip()
-                    prev = updated_to.get(item_key)
-                    if prev and prev != new_val:
-                        raise ValueError(
-                            "Conflicting intent: multiple updates for same old TXT value with different new_text. "
-                            f"Record={item_key} new_text='{prev}' vs '{new_val}'"
-                        )
-                    updated_to[item_key] = new_val
-
-        return self
-
-
-# -----------------------------
-# IO + Reporting
-# -----------------------------
-
-def load_yaml(path: Path) -> Any:
+def load_json(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return json.load(f)
 
 
-def write_outputs(
-    out_dir: Path,
-    normalized_requests: List[Dict[str, Any]],
-    errors: List[str],
-    warnings: List[str],
-    file_results: List[Dict[str, Any]],
-) -> None:
-    """Write machine + human artifacts."""
-    out_dir.mkdir(parents=True, exist_ok=True)
+def write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
-    norm_path = out_dir / "normalized_requests.json"
-    with norm_path.open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "generated_at": now_iso(),
-                "count": len(normalized_requests),
-                "requests": normalized_requests,
+
+def write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+# -----------------------------
+# Config
+# -----------------------------
+
+@dataclass(frozen=True)
+class BamAuthConfig:
+    """
+    Auth config for BAM session login.
+    You said you have user/pass in CI vars and hit: /api/v2/sessions
+    """
+    base_url: str
+    username: str
+    password: str
+    verify_ssl: bool = False
+    timeout_sec: int = 30
+
+
+@dataclass(frozen=True)
+class PlannerConfig:
+    """
+    Planner-level decisions.
+    """
+    # If a requested zone does not exist, safest is to FAIL (record ops cannot succeed)
+    fail_on_missing_zone: bool = True
+
+    # If any lookup is ambiguous (e.g., more than one match where we expect one),
+    # safest is to FAIL rather than guessing.
+    fail_on_ambiguous_match: bool = True
+
+
+def read_config_from_env() -> Tuple[BamAuthConfig, PlannerConfig]:
+    # Required
+    base_url = os.environ.get("BAM_BASE_URL", "").strip().rstrip("/")
+    user = os.environ.get("BAM_USER", "").strip()
+    pw = os.environ.get("BAM_PASS", "").strip()
+
+    if not base_url or not user or not pw:
+        raise ValueError("Missing required env vars: BAM_BASE_URL, BAM_USER, BAM_PASS")
+
+    auth = BamAuthConfig(
+        base_url=base_url,
+        username=user,
+        password=pw,
+        verify_ssl=False,
+        timeout_sec=30,
+    )
+
+    planner_cfg = PlannerConfig(
+        fail_on_missing_zone=os.environ.get("PLAN_FAIL_ON_MISSING_ZONE", "true").strip().lower() != "false",
+        fail_on_ambiguous_match=os.environ.get("PLAN_FAIL_ON_AMBIGUOUS", "true").strip().lower() != "false",
+    )
+    return auth, planner_cfg
+
+
+# -----------------------------
+# BAM API Client (generic)
+# -----------------------------
+
+class BamApiClient:
+    """
+    Generic BAM API v2 client:
+    - Handles session login: POST /api/v2/sessions
+    - Stores auth token for subsequent calls
+    - Provides a single request() method (GET/POST/etc.)
+    """
+
+    def __init__(self, cfg: BamAuthConfig) -> None:
+        self.cfg = cfg
+        self._token: Optional[str] = None
+        self._session = requests.Session()
+
+    def login(self) -> None:
+        """
+        Logs in and stores token.
+        Endpoint provided by you: /api/v2/sessions
+        """
+        url = f"{self.cfg.base_url}/api/v2/sessions"
+        payload = {"username": self.cfg.username, "password": self.cfg.password}
+
+        resp = self._session.post(
+            url,
+            json=payload,
+            timeout=self.cfg.timeout_sec,
+            verify=self.cfg.verify_ssl,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Token field name can vary by deployment; handle common patterns.
+        token = data.get("basicAuthenticationCredentials")
+        if not token:
+            raise RuntimeError(f"Login succeeded but token not found in response keys: {list(data.keys())}")
+        self._token = str(token)
+
+    def request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None,
+                json_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Perform an authenticated request to BAM.
+        `path` must start with /api/v2/...
+        """
+        if not self._token:
+            raise RuntimeError("Not logged in. Call login() first.")
+
+        url = f"{self.cfg.base_url}{path}"
+        headers = {
+            "Authorization": f"Basic {self._token}",
+            "Accept": "application/json",
+        }
+        resp = self._session.request(
+            method=method.upper(),
+            url=url,
+            headers=headers,
+            params=params,
+            json=json_body,
+            timeout=self.cfg.timeout_sec,
+            verify=self.cfg.verify_ssl,
+        )
+        resp.raise_for_status()
+        # Some endpoints may return empty body; normalize to {}
+        if not resp.content:
+            return {}
+        return resp.json()
+
+
+# -----------------------------
+# DNS Adapter (BAM-specific lookups)
+# -----------------------------
+
+@dataclass(frozen=True)
+class ZoneRef:
+    view: str
+    zone: str
+    zone_id: str
+
+
+@dataclass(frozen=True)
+class TxtRecordRef:
+    view: str
+    zone: str
+    name: str
+    text: str
+    record_id: str
+
+
+class BlueCatDnsAdapter:
+    """
+    All BAM DNS endpoint knowledge should live here.
+
+    For MVP Plan we need ONLY:
+      - zone_exists(view, zone) -> ZoneRef | None
+      - txt_exact_match(view, zone, name, text) -> List[TxtRecordRef]
+
+    You will plug in the correct endpoints in these methods.
+    Everything else (planning rules, reports, outputs) will work unchanged.
+    """
+
+    def __init__(self, api: BamApiClient) -> None:
+        self.api = api
+
+    def zone_exists(self, view: str, zone: str) -> Optional[ZoneRef]:
+        """
+        view comes from user as 'internal' but API shows view.name like 'Internal'
+        """
+        view_name = view[:1].upper() + view[1:] if view else ""
+
+        # Build filter: absoluteName == fqdn AND view.name == Internal (optional)
+        flt = f"absoluteName:eq('{zone}')"
+        if view_name:
+            flt = f"{flt} and view.name:eq('{view_name}')"
+
+        data = self.api.request("GET", "/api/v2/zones", params={"filter": flt})
+
+        items = data.get("data") or []
+        if len(items) == 0:
+            return None
+        if len(items) > 1:
+            raise RuntimeError(f"Ambiguous zone lookup for zone={zone} view={view_name} (count={len(items)})")
+        
+        return ZoneRef(view=view, zone=zone, zone_id=str(items[0]["id"]))
+
+    def txt_exact_match(self, view: str, zone: str, name: str, text: str) -> List[TxtRecordRef]:
+        zone_ref = self.zone_exists(view, zone)
+        if zone_ref is None:
+            return []
+        
+        data = self.api.request(
+            "GET",
+            f"/api/v2/zones/{zone_ref.zone_id}/resourceRecords",
+            params={
+                "filter": f"name:eq('{name}')"
             },
-            f,
-            indent=2,
         )
 
-    rep_path = out_dir / "validation_report.md"
-    with rep_path.open("w", encoding="utf-8") as f:
-        f.write("# Validation Report\n\n")
-        f.write(f"- Generated: `{now_iso()}`\n")
-        f.write(f"- Files received: `{len(file_results)}`\n")
-        f.write(f"- Files normalized: `{len(normalized_requests)}`\n")
-        f.write(f"- Errors: `{len(errors)}`\n")
-        f.write(f"- Warnings: `{len(warnings)}`\n\n")
+        items = data.get("data") or []
+        matches: List[TxtRecordRef] = []
 
-        if file_results:
-            f.write("## File Results\n\n")
-            for result in file_results:
-                file_name = result["file"]
-                file_errors = result["errors"]
-                file_warnings = result["warnings"]
+        for item in items:
+            # Ensure we only consider TXT
+            if item.get("recordType") != "TXT":
+                continue
+            if item.get("text") != text:
+                continue
 
-                status = "INVALID" if file_errors else "VALID"
-                f.write(f"### `{file_name}`\n\n")
-                f.write(f"- Status: **{status}**\n")
-                f.write(f"- Errors: `{len(file_errors)}`\n")
-                f.write(f"- Warnings: `{len(file_warnings)}`\n")
+            matches.append(
+                TxtRecordRef(
+                    view=view,
+                    zone=zone,
+                    name=name,
+                    text=text,
+                    record_id=str(item["id"]),
+                )
+            )
+        return matches
 
-                if file_errors:
-                    f.write("\n#### Errors\n\n")
-                    for err in file_errors:
-                        f.write(f"- **ERROR** {err}\n")
 
-                if file_warnings:
-                    f.write("\n#### Warnings\n\n")
-                    for warn in file_warnings:
-                        f.write(f"- **WARN** {warn}\n")
+# -----------------------------
+# Planning Domain
+# -----------------------------
 
-                f.write("\n")
+@dataclass
+class PlanItem:
+    # Required attributes without default values
+    request_key: str
+    user_email: str
+    labels: List[str]
+    view: str
+    type: str
+    zone: str
+    name: str
+    action: str  # create|update|delete
+    text: str
+    planned: str  # create|update|delete|skip|fail
+    reason: str
+    details: Dict[str, Any]
+    new_text: Optional[str]
+    zone_id: Optional[str] = None 
 
-        if errors:
-            f.write("## All Errors\n\n")
-            for e in errors:
-                f.write(f"- **ERROR** {e}\n")
-            f.write("\n")
 
-        if warnings:
-            f.write("## All Warnings\n\n")
-            for w in warnings:
-                f.write(f"- **WARN** {w}\n")
-            f.write("\n")
+class Planner:
+    """
+    Implements MVP planning rules (idempotent, no unnecessary change-control tasks).
 
-        if not errors and not warnings:
-            f.write("No issues found.\n")
+    Rules (TXT MVP):
+      create:
+        - if exact (name+text) exists -> SKIP
+        - else -> CREATE
+      delete:
+        - if exact exists -> DELETE
+        - else -> SKIP
+      update (replace old->new):
+        - if old doesn't exist -> SKIP
+        - if new already exists -> SKIP
+        - else -> UPDATE
 
+    Safety:
+      - Zone must exist (FAIL if missing, per config)
+      - If lookup returns >1 and config.fail_on_ambiguous_match -> FAIL
+    """
+
+    def __init__(self, dns: BlueCatDnsAdapter, cfg: PlannerConfig) -> None:
+        self.dns = dns
+        self.cfg = cfg
+
+    def plan_txt(self, item: PlanItem) -> PlanItem:
+        # 1) Zone must exist
+        try:
+            z = self.dns.zone_exists(item.view, item.zone)
+        except NotImplementedError as nie:
+            return self._fail(item, f"DNS adapter not implemented: {nie}")
+        except Exception as e:
+            return self._fail(item, f"Zone lookup error: {e}")
+
+        if z is None:
+            if self.cfg.fail_on_missing_zone:
+                return self._fail(item, "Zone does not exist")
+            return self._skip(item, "Zone does not exist (configured to skip)")
+        
+        item.zone_id = z.zone_id
+        
+        # 2) Action-specific lookups
+        if item.action == "create":
+            return self._plan_create(item)
+        if item.action == "delete":
+            return self._plan_delete(item)
+        if item.action == "update":
+            return self._plan_update(item)
+        return self._fail(item, f"Unsupported action: {item.action}")
+
+    def _plan_create(self, item: PlanItem) -> PlanItem:
+        matches = self._safe_txt_lookup(item.view, item.zone, item.name, item.text, item)
+        if matches is None:
+            return item  # already failed in _safe_txt_lookup
+
+        if len(matches) == 0:
+            return self._create(item, "Exact TXT does not exist; create is needed", {"match_count": 0})
+        return self._skip(item, "Exact TXT already exists; skipping to avoid unnecessary task", {"match_count": len(matches)})
+
+    def _plan_delete(self, item: PlanItem) -> PlanItem:
+        matches = self._safe_txt_lookup(item.view, item.zone, item.name, item.text, item)
+        if matches is None:
+            return item
+
+        if len(matches) == 0:
+            return self._skip(item, "Exact TXT does not exist; skipping delete", {"match_count": 0})
+        return self._delete(item, "Exact TXT exists; delete is needed", {"match_count": len(matches), "rr_id": matches[0].record_id, "record_ids": [m.record_id for m in matches]})
+
+    def _plan_update(self, item: PlanItem) -> PlanItem:
+        if not item.new_text:
+            return self._fail(item, "update requires new_text")
+
+        # Lookup old
+        old_matches = self._safe_txt_lookup(item.view, item.zone, item.name, item.text, item)
+        if old_matches is None:
+            return item
+
+        if len(old_matches) == 0:
+            return self._skip(item, "Old TXT value not found; skipping update", {"old_match_count": 0})
+
+        # Lookup new
+        new_matches = self._safe_txt_lookup(item.view, item.zone, item.name, item.new_text, item)
+        if new_matches is None:
+            return item
+
+        if len(new_matches) > 0:
+            return self._skip(item, "New TXT value already exists; skipping update", {"new_match_count": len(new_matches)})
+
+        # Otherwise, plan an update (delete old + create new)
+        return self._update(
+            item,
+            "Old exists and new does not; update is needed.",
+            {
+                "rr_id": old_matches[0].record_id,
+                "old_record_ids": [m.record_id for m in old_matches],
+                "old_match_count": len(old_matches),
+                "new_match_count": len(new_matches),
+            },
+        )
+
+    def _safe_txt_lookup(self, view: str, zone: str, name: str, text: str, item: PlanItem) -> Optional[List[TxtRecordRef]]:
+        try:
+            matches = self.dns.txt_exact_match(view=view, zone=zone, name=name, text=text)
+        except NotImplementedError as nie:
+            updated = self._fail(item, f"DNS adapter not implemented: {nie}")
+            item.planned, item.reason, item.details = updated.planned, updated.reason, updated.details
+            return None
+        except Exception as e:
+            updated = self._fail(item, f"TXT lookup error: {e}")
+            item.planned, item.reason, item.details = updated.planned, updated.reason, updated.details
+            return None
+
+        if self.cfg.fail_on_ambiguous_match and len(matches) > 1:
+            updated = self._fail(item, "Ambiguous match: more than one exact TXT record found", {"match_count": len(matches)})
+            item.planned, item.reason, item.details = updated.planned, updated.reason, updated.details
+            return None
+
+        return matches
+
+    # Outcome helpers
+    def _fail(self, item: PlanItem, reason: str, details: Optional[Dict[str, Any]] = None) -> PlanItem:
+        item.planned = "fail"
+        item.reason = reason
+        item.details = details or {}
+        return item
+
+    def _skip(self, item: PlanItem, reason: str, details: Optional[Dict[str, Any]] = None) -> PlanItem:
+        item.planned = "skip"
+        item.reason = reason
+        item.details = details or {}
+        return item
+
+    def _create(self, item: PlanItem, reason: str, details: Dict[str, Any]) -> PlanItem:
+        item.planned = "create"
+        item.reason = reason
+        item.details = details
+        return item
+
+    def _delete(self, item: PlanItem, reason: str, details: Dict[str, Any]) -> PlanItem:
+        item.planned = "delete"
+        item.reason = reason
+        item.details = details
+        return item
+
+    def _update(self, item: PlanItem, reason: str, details: Dict[str, Any]) -> PlanItem:
+        item.planned = "update"
+        item.reason = reason
+        item.details = details
+        return item
+
+
+# -----------------------------
+# Parsing normalized_requests.json -> PlanItems
+# -----------------------------
+
+def build_plan_items(normalized: Dict[str, Any]) -> List[PlanItem]:
+    items: List[PlanItem] = []
+
+    for req in normalized.get("requests", []):
+        request_key = req.get("request_key", "")
+        user_email = req.get("user_email", "")
+        for act in req.get("actions", []):
+            action = act.get("action")
+            view = act.get("view", "internal")
+            labels = act.get("labels", []) or []
+
+            for rec in act.get("records", []):
+                if rec.get("type") != "txt":
+                    # Future-proof: ignore non-txt for now
+                    continue
+
+                items.append(
+                    PlanItem(
+                        request_key=request_key,
+                        user_email=user_email,
+                        labels=labels,
+                        view=view,
+                        type="txt",
+                        zone=rec.get("zone", ""),
+                        name=rec.get("name", ""),
+                        action=action,
+                        text=rec.get("text", ""),
+                        new_text=rec.get("new_text"),
+                        planned="fail",   # default, planner will set final state
+                        reason="not planned yet",
+                        details={},
+                    )
+                )
+
+    return items
+
+
+# -----------------------------
+# Reporting
+# -----------------------------
+
+def summarize(plan_items: List[PlanItem]) -> Dict[str, int]:
+    counts: Dict[str, int] = {"create": 0, "update": 0, "delete": 0, "skip": 0, "fail": 0}
+    for it in plan_items:
+        counts[it.planned] = counts.get(it.planned, 0) + 1
+    return counts
+
+
+def render_plan_report(plan_items: List[PlanItem], counts: Dict[str, int]) -> str:
+    lines: List[str] = []
+    lines.append("# Plan Report\n")
+    lines.append(f"- Generated: `{now_iso()}`")
+    lines.append(f"- Total items: `{len(plan_items)}`")
+    lines.append(f"- Create: `{counts.get('create', 0)}`")
+    lines.append(f"- Update: `{counts.get('update', 0)}`")
+    lines.append(f"- Delete: `{counts.get('delete', 0)}`")
+    lines.append(f"- Skip: `{counts.get('skip', 0)}`")
+    lines.append(f"- Fail: `{counts.get('fail', 0)}`\n")
+
+    # Show only failures + a short per-item summary (keeps the report readable)
+    failures = [it for it in plan_items if it.planned == "fail"]
+    if failures:
+        lines.append("## Failures\n")
+        for it in failures:
+            lines.append(
+                f"- **FAIL** `{it.request_key}` :: `{it.view}` `{it.zone}` `{it.name}` `{it.type}` "
+                f"action=`{it.action}` text=`{it.text}` new_text=`{it.new_text}` â€” {it.reason}"
+            )
+        lines.append("")
+
+    lines.append("## Items\n")
+    for it in plan_items:
+        lines.append(
+            f"- `{it.planned.upper()}` `{it.view}` `{it.zone}` `{it.name}` `{it.type}` "
+            f"action=`{it.action}` text=`{it.text}` new_text=`{it.new_text}` â€” {it.reason}"
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+# -----------------------------
+# Main
+# -----------------------------
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("files", nargs="+", help="Request YAML files to validate (e.g. requests/foo.yml)")
-    parser.add_argument("--out", default="out", help="Output directory (default: out)")
+    parser.add_argument("--in", dest="input_path", required=True, help="Input normalized_requests.json")
+    parser.add_argument("--out", dest="out_dir", default="out", help="Output directory (default: out)")
     args = parser.parse_args()
 
-    errors: List[str] = []
-    warnings: List[str] = []
-    normalized: List[Dict[str, Any]] = []
-    file_results: List[Dict[str, Any]] = []
+    in_path = Path(args.input_path)
+    out_dir = Path(args.out_dir)
 
-    for f in args.files:
-        p = Path(f)
-        file_errors: List[str] = []
-        file_warnings: List[str] = []
+    if not in_path.exists():
+        print(f"ERROR: input file does not exist: {in_path}", file=sys.stderr)
+        return 2
 
-        if not p.exists():
-            msg = f"`{f}`: file does not exist"
-            errors.append(msg)
-            file_errors.append(msg)
-            file_results.append({"file": f, "errors": file_errors, "warnings": file_warnings})
+    # Load normalized contract
+    normalized = load_json(in_path)
+    plan_items = build_plan_items(normalized)
+
+    # Auth + client
+    try:
+        auth_cfg, planner_cfg = read_config_from_env()
+    except Exception as e:
+        # If env not set, fail fast; this stage depends on BAM access.
+        plan_payload = {
+            "generated_at": now_iso(),
+            "error": f"Config error: {e}",
+            "counts": {"fail": len(plan_items)},
+            "items": [asdict(it) for it in plan_items],
+        }
+        write_json(out_dir / "plan.json", plan_payload)
+        write_text(out_dir / "plan_report.md", f"# Plan Report\n\nâŒ Config error: {e}\n")
+        return 2
+
+    api = BamApiClient(auth_cfg)
+    try:
+        api.login()
+        # DEBUGGING BLOCK
+        # dns = BlueCatDnsAdapter(api)
+        # z = dns.zone_exists("internal", "mgictest.com")
+        # print("ZONE LOOKUP RESULT:", z)
+        # return 0
+        # DEBUGGING BLOCK
+    except Exception as e:
+        write_text(out_dir / "plan_report.md", f"# Plan Report\n\nâŒ BAM login failed: {e}\n")
+        write_json(out_dir / "plan.json", {"generated_at": now_iso(), "error": f"login failed: {e}", "items": []})
+        return 2
+
+    dns = BlueCatDnsAdapter(api)
+    planner = Planner(dns, planner_cfg)
+
+    # Plan each TXT item
+    planned: List[PlanItem] = []
+    for it in plan_items:
+        if it.type != "txt":
+            it.planned = "skip"
+            it.reason = "Non-TXT type not supported in MVP"
+            it.details = {}
+            planned.append(it)
             continue
+        planned.append(planner.plan_txt(it))
 
-        if p.suffix.lower() not in {".yml", ".yaml"}:
-            msg = f"`{f}`: file extension must be .yml or .yaml"
-            errors.append(msg)
-            file_errors.append(msg)
-            file_results.append({"file": f, "errors": file_errors, "warnings": file_warnings})
-            continue
+    counts = summarize(planned)
 
-        raw = load_yaml(p)
-        if raw is None:
-            msg = f"`{f}`: empty or invalid YAML"
-            errors.append(msg)
-            file_errors.append(msg)
-            file_results.append({"file": f, "errors": file_errors, "warnings": file_warnings})
-            continue
+    # Write outputs
+    plan_payload = {
+        "generated_at": now_iso(),
+        "counts": counts,
+        "items": [asdict(it) for it in planned],
+    }
+    write_json(out_dir / "plan.json", plan_payload)
+    write_text(out_dir / "plan_report.md", render_plan_report(planned, counts))
 
-        try:
-            req = RequestFile.model_validate(raw)
-        except ValidationError as ve:
-            for e in ve.errors():
-                loc = ".".join(str(x) for x in e.get("loc", [])) or "(root)"
-                msg = e.get("msg", "validation error")
-                full_msg = f"`{f}` :: `{loc}` — {msg}"
-                errors.append(full_msg)
-                file_errors.append(full_msg)
-
-            file_results.append({"file": f, "errors": file_errors, "warnings": file_warnings})
-            continue
-        except ValueError as ve:
-            full_msg = f"`{f}` :: (root) — {str(ve)}"
-            errors.append(full_msg)
-            file_errors.append(full_msg)
-            file_results.append({"file": f, "errors": file_errors, "warnings": file_warnings})
-            continue
-
-        for ai, a in enumerate(req.actions):
-            if a.action == "update":
-                for ri, r in enumerate(a.records):
-                    if (r.text or "").strip() == (r.new_text or "").strip():
-                        warn_msg = (
-                            f"`{f}` :: `actions[{ai}].records[{ri}]` — update has text == new_text; "
-                            "this will be skipped later (noop)."
-                        )
-                        warnings.append(warn_msg)
-                        file_warnings.append(warn_msg)
-
-        normalized.append(
-            {
-                "request_key": str(p).replace("\\", "/"),
-                "user_email": str(req.user_email),
-                "actions": [a.model_dump() for a in req.actions],
-            }
-        )
-
-        file_results.append({"file": f, "errors": file_errors, "warnings": file_warnings})
-
-    out_dir = Path(args.out)
-    write_outputs(out_dir, normalized, errors, warnings, file_results)
-
-    return 2 if errors else 0
+    # Fail the job if any plan item is fail (keeps pipeline honest)
+    return 2 if counts.get("fail", 0) > 0 else 0
 
 
 if __name__ == "__main__":
