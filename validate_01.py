@@ -1,49 +1,230 @@
 #!/usr/bin/env python3
 """
-Validate + normalize BlueCat change request YAML files using Pydantic (MVP: TXT only).
+------------------------------------------------------------------------------
+Script: validate_requests.py
+------------------------------------------------------------------------------
 
-Why this script exists
-----------------------
-This script ONLY validates structure and normalizes user input (lowercase, defaults, trimming).
-It does NOT talk to BlueCat, and it does NOT decide create/skip/update/delete based on current state.
-That state-aware logic belongs to later stages (Plan/Apply).
+Purpose
+------------------------------------------------------------------------------
+This script validates and normalizes BlueCat change request YAML files before
+they enter later stages of the automation pipeline.
 
-Current MVP contract (TXT only)
--------------------------------
-Top level:
-- user_email: required
-- actions: required (non-empty list)
+The script ensures that request files follow the expected schema and contain
+logically consistent operations. It performs structural validation and input
+normalization only.
 
-Action:
-- action: create | update | delete
-- view: optional, defaults to "internal"
-- labels: optional, defaults to []
-- records: required (non-empty list)
+Important:
+This script does NOT communicate with BlueCat and does NOT evaluate the
+current DNS state. Decisions such as create/skip/update/delete based on
+existing records are handled in later pipeline stages (Plan/Apply).
 
-TXT record:
-- type: "txt"
-- zone: required string
-- name: required string
-- text: required string
-- new_text: required ONLY when action == update
+The goal of this stage is to guarantee that user-provided YAML files are:
 
-Important design note (RRset-friendly)
---------------------------------------
-We treat a single TXT "value" as an item uniquely identified by:
-  (view, zone, name, type, text)
+    - structurally valid
+    - internally consistent
+    - normalized for downstream processing
 
-That means:
-- Multiple TXT values under the same name are allowed (RRset semantics).
-- Delete and update target a specific TXT value (requires text).
-- Update is modeled as "replace old value with new value" (text -> new_text).
 
-Outputs:
-- out/normalized_requests.json
-- out/validation_report.md
+------------------------------------------------------------------------------
+Input
+------------------------------------------------------------------------------
+The script accepts one or more request YAML files as positional arguments:
 
-Exit code:
-- 0 if valid
-- 2 if any validation errors
+    validate_requests.py requests/example.yml requests/test.yaml
+
+Each file must:
+
+    - exist on disk
+    - have extension .yml or .yaml
+    - contain valid YAML
+
+
+------------------------------------------------------------------------------
+Data Model (TXT-only MVP)
+------------------------------------------------------------------------------
+
+Top-level structure:
+
+    user_email: required
+    actions: required (non-empty list)
+
+Action structure:
+
+    action: create | update | delete
+    view: optional, defaults to "internal"
+    labels: optional metadata list (defaults to [])
+    records: required (non-empty list)
+
+TXT record structure:
+
+    type: "txt"
+    zone: required string
+    name: required string
+    text: required string
+    new_text: required ONLY when action == update
+
+
+------------------------------------------------------------------------------
+Normalization Behavior
+------------------------------------------------------------------------------
+User input is normalized before being passed downstream.
+
+The script automatically:
+
+    - converts record type to lowercase ("TXT" -> "txt")
+    - converts action to lowercase
+    - converts view to lowercase
+    - trims whitespace from strings
+    - converts null labels to empty list []
+    - trims whitespace inside label values
+
+These transformations ensure that later pipeline stages operate on clean,
+consistent data.
+
+
+------------------------------------------------------------------------------
+TXT Record Design (RRset-friendly)
+------------------------------------------------------------------------------
+TXT records are treated as individual values within a DNS RRset.
+
+Each TXT value is uniquely identified by:
+
+    (view, zone, name, type, text)
+
+This allows multiple TXT values under the same name.
+
+Examples:
+
+    _acme-challenge.example.com TXT "token1"
+    _acme-challenge.example.com TXT "token2"
+
+These are treated as separate items.
+
+Operation semantics:
+
+Create:
+    adds a TXT value
+
+Delete:
+    removes a specific TXT value
+
+Update:
+    replaces a TXT value
+    (text -> new_text)
+
+
+------------------------------------------------------------------------------
+Action Validation Rules
+------------------------------------------------------------------------------
+
+CREATE
+    - text is required
+    - new_text MUST NOT be provided
+
+UPDATE
+    - text is required (old value)
+    - new_text is required (replacement value)
+
+DELETE
+    - text is required
+    - new_text MUST NOT be provided
+
+
+------------------------------------------------------------------------------
+File-Level Consistency Checks
+------------------------------------------------------------------------------
+The script prevents contradictory instructions within the same YAML file.
+
+Using the TXT item key:
+
+    (view, zone, name, type, text)
+
+The following situations are blocked:
+
+    - create AND delete of the same TXT value in one file
+    - update AND delete of the same TXT value in one file
+    - multiple updates of the same TXT value with different new_text
+    - exact duplicate instructions
+
+These checks prevent ambiguous or conflicting change requests.
+
+
+------------------------------------------------------------------------------
+Warnings
+------------------------------------------------------------------------------
+Some conditions are allowed but produce warnings.
+
+Example:
+
+    update where text == new_text
+
+This represents a no-op change and will later be skipped during the Plan
+stage, but the request is still considered valid.
+
+
+------------------------------------------------------------------------------
+Outputs
+------------------------------------------------------------------------------
+
+1) normalized_requests.json
+
+Machine-readable artifact containing normalized request objects.
+
+Structure:
+
+    {
+      "generated_at": "<UTC timestamp>",
+      "count": <number_of_requests>,
+      "requests": [...]
+    }
+
+Each request entry contains:
+
+    - request_key (original file path)
+    - user_email
+    - normalized actions
+
+
+2) validation_report.md
+
+Human-readable validation report containing:
+
+    - generation timestamp
+    - number of processed files
+    - validation errors
+    - warnings
+    - summary status
+
+
+------------------------------------------------------------------------------
+Exit Codes
+------------------------------------------------------------------------------
+
+Exit 0
+    Validation successful (no errors)
+
+Exit 2
+    One or more validation errors detected
+
+
+------------------------------------------------------------------------------
+Design Philosophy
+------------------------------------------------------------------------------
+This validator intentionally performs only schema validation and logical
+consistency checks.
+
+It does NOT:
+
+    - check whether DNS records already exist
+    - determine whether operations are necessary
+    - communicate with BlueCat APIs
+
+Those responsibilities belong to later pipeline stages that have access
+to live infrastructure state.
+
+By keeping validation deterministic and state-independent, the pipeline
+remains predictable and easier to audit.
+------------------------------------------------------------------------------
 """
 
 from __future__ import annotations
