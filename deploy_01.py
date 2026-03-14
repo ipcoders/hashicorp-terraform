@@ -1,26 +1,340 @@
 #!/usr/bin/env python3
 """
-Deploy stage (write) for BlueCat GitOps MVP (TXT only).
+------------------------------------------------------------------------------
+Script: deploy_requests.py
+------------------------------------------------------------------------------
 
-Input:
-  out/plan.json   (from plan stage)
+Purpose
+------------------------------------------------------------------------------
+This script performs the Deploy stage for the BlueCat GitOps MVP.
 
-Output:
-  out/deploy_report.md
+It reads the action plan produced by the Plan stage and executes the approved
+TXT record operations against BlueCat BAM.
 
-Behavior (MVP):
-- Executes only items planned as: create/update/delete
-- Skips items planned as: skip
-- Fails the job if any item is planned as: fail OR if any execution call fails
+This is the first stage in the pipeline that performs write operations.
 
-BlueCat endpoints (provided by you):
-- Create RR under zone: POST   /api/v2/zones/<zone_id>/resourceRecords
-- Delete RR by id:      DELETE /api/v2/resourceRecords/<rr_id>
-- Update RR by id:      PUT    /api/v2/resourceRecords/<rr_id>
+Its job is to take the planner's decisions and carry them out in BAM for
+items that were explicitly planned as:
 
-Important:
-- We are using a limited BAM account so BAM will create Change Control tasks.
-- We do NOT verify task creation in MVP (no post-checks).
+    - create
+    - update
+    - delete
+
+This stage does NOT perform planning logic again. It trusts the plan artifact
+and executes only what the plan stage determined to be necessary and safe.
+
+
+------------------------------------------------------------------------------
+Input
+------------------------------------------------------------------------------
+The script expects a planning artifact as input:
+
+    out/plan.json
+
+This file is produced by plan_requests.py and contains a list of planned TXT
+record actions.
+
+The current contract consumed by this script is:
+
+    {
+      "generated_at": "...",
+      "counts": {
+        "create": <n>,
+        "update": <n>,
+        "delete": <n>,
+        "skip": <n>,
+        "fail": <n>
+      },
+      "items": [
+        {
+          "request_key": "...",
+          "user_email": "...",
+          "labels": [...],
+          "view": "...",
+          "type": "txt",
+          "zone": "...",
+          "name": "...",
+          "action": "create|update|delete",
+          "text": "...",
+          "new_text": "...",
+          "planned": "create|update|delete|skip|fail",
+          "reason": "...",
+          "details": {...},
+          "zone_id": "..."
+        }
+      ]
+    }
+
+Only TXT records are executed in the current MVP.
+
+
+------------------------------------------------------------------------------
+Output
+------------------------------------------------------------------------------
+The script produces one artifact:
+
+1) out/deploy_report.md
+
+Human-readable deployment report containing:
+
+    - generation timestamp
+    - execution counts
+    - failure details
+    - per-item execution results
+
+
+------------------------------------------------------------------------------
+External Dependencies
+------------------------------------------------------------------------------
+This stage requires access to BlueCat BAM through API v2.
+
+It authenticates using:
+
+    POST /api/v2/sessions
+
+and then executes write operations using the following endpoints:
+
+    Create record under zone:
+        POST /api/v2/zones/<zone_id>/resourceRecords
+
+    Delete record by record ID:
+        DELETE /api/v2/resourceRecords/<rr_id>
+
+    Update record by record ID:
+        PUT /api/v2/resourceRecords/<rr_id>
+
+Required environment variables:
+
+    BAM_BASE_URL
+    BAM_USER
+    BAM_PASS
+
+For MVP, SSL verification is disabled because the environment uses self-signed
+or internal certificates.
+
+
+------------------------------------------------------------------------------
+High-Level Flow
+------------------------------------------------------------------------------
+The script performs the following steps:
+
+1. Load plan.json
+2. Verify the file exists
+3. Fail immediately if any item in the plan is already marked as planned=fail
+4. Read BlueCat authentication settings from environment variables
+5. Log in to BlueCat BAM
+6. For each plan item:
+       - execute CREATE if planned=create
+       - execute UPDATE if planned=update
+       - execute DELETE if planned=delete
+       - record SKIP if planned=skip
+       - record FAIL if the item is invalid or execution fails
+7. Write deploy_report.md
+8. Return non-zero exit code if any item fails
+
+
+------------------------------------------------------------------------------
+Execution Model (TXT-only MVP)
+------------------------------------------------------------------------------
+This stage executes only TXT record operations.
+
+It does not perform fresh BAM lookups to re-evaluate state. Instead, it relies
+on the planning artifact generated earlier in the pipeline.
+
+Execution is driven by the value of each item's `planned` field:
+
+    create -> perform API create call
+    update -> perform API update call
+    delete -> perform API delete call
+    skip   -> do not execute anything
+    fail   -> treat as deployment failure
+
+This strict separation keeps responsibilities clear:
+
+    validate stage -> structure and normalization
+    plan stage     -> state-aware decision making
+    deploy stage   -> execution only
+
+
+------------------------------------------------------------------------------
+Supported Actions
+------------------------------------------------------------------------------
+
+CREATE
+    Behavior:
+        - requires zone_id from the plan stage
+        - sends POST request to create a TXT record under the resolved zone
+
+    API payload:
+        {
+          "type": "TXTRecord",
+          "name": "<record_name>",
+          "text": "<txt_value>"
+        }
+
+
+DELETE
+    Behavior:
+        - requires details.rr_id from the plan stage
+        - sends DELETE request for the specific TXT record ID
+
+
+UPDATE
+    Behavior:
+        - requires details.rr_id from the plan stage
+        - requires new_text
+        - sends PUT request to update the existing TXT record value
+
+    API payload:
+        {
+          "type": "TXTRecord",
+          "name": "<record_name>",
+          "text": "<new_txt_value>"
+        }
+
+
+------------------------------------------------------------------------------
+Safety Rules
+------------------------------------------------------------------------------
+This stage is intentionally strict.
+
+1) plan.json must not contain any planned=fail items
+   If the plan artifact already includes failures, deployment stops
+   immediately.
+
+   Reason:
+   The plan stage is the source of truth for whether execution is safe.
+
+2) zone_id is required for planned=create
+   If zone_id is missing, deployment fails for that item.
+
+   Reason:
+   Create operations need a parent zone container.
+
+3) details.rr_id is required for planned=delete and planned=update
+   If rr_id is missing, deployment fails for that item.
+
+   Reason:
+   Delete and update operations must target a specific existing record.
+
+4) new_text is required for planned=update
+   If new_text is missing, deployment fails for that item.
+
+5) unsupported planned values result in FAIL
+   Any unexpected value outside:
+
+        create | update | delete | skip | fail
+
+   is treated as an execution error.
+
+6) non-TXT records are skipped
+   Non-TXT records are not supported in the current MVP.
+
+
+------------------------------------------------------------------------------
+Execution Outcomes
+------------------------------------------------------------------------------
+Each processed plan item receives one final deployment result:
+
+OK
+    The requested BAM write operation completed successfully.
+
+    Examples:
+        - TXT record created
+        - TXT record updated
+        - TXT record deleted
+
+SKIP
+    No BAM API call was executed for the item.
+
+    Examples:
+        - the plan item was marked planned=skip
+        - the item type is not TXT in the current MVP
+
+FAIL
+    The deploy stage could not safely execute the item.
+
+    Examples:
+        - plan.json already contained planned=fail items
+        - required fields such as zone_id or rr_id were missing
+        - BAM login failed
+        - the BAM API call returned an error
+        - the planned value was unsupported
+
+
+Pipeline behavior:
+
+    OK    -> pipeline continues
+    SKIP  -> pipeline continues
+    FAIL  -> pipeline exits with error (exit code 2)
+
+
+------------------------------------------------------------------------------
+Change Control Behavior
+------------------------------------------------------------------------------
+The BAM account used by this stage is limited and is expected to create
+Change Control tasks automatically when write operations are submitted.
+
+Current MVP behavior:
+
+    - write calls are executed
+    - Change Control task creation is assumed
+    - no post-check is performed to verify task creation
+
+This means the script confirms that the API request succeeded, but it does
+not yet verify downstream workflow objects such as generated tasks.
+
+
+------------------------------------------------------------------------------
+Report Design
+------------------------------------------------------------------------------
+deploy_report.md is designed for human review.
+
+It contains:
+
+    - total counts by result (OK / SKIP / FAIL)
+    - a failures section for fast troubleshooting
+    - a full item-by-item execution summary
+
+The report is intended to make CI results easy to review without requiring
+users to inspect raw logs.
+
+
+------------------------------------------------------------------------------
+Exit Codes
+------------------------------------------------------------------------------
+
+Exit 0
+    Deployment completed and no item failed
+
+Exit 2
+    One or more of the following occurred:
+        - input file missing
+        - configuration error
+        - BAM login failure
+        - plan.json contained planned=fail items
+        - at least one deployment item failed
+
+
+------------------------------------------------------------------------------
+Design Philosophy
+------------------------------------------------------------------------------
+This stage is deliberately narrow in responsibility.
+
+It does NOT:
+
+    - validate YAML structure
+    - normalize request content
+    - decide whether a change is needed
+    - re-plan against live BAM state
+    - verify Change Control task creation after submission
+
+Those responsibilities belong to earlier or future stages.
+
+The deploy stage exists to execute the approved plan as-is, fail loudly when
+required execution data is missing, and keep the pipeline behavior predictable
+and auditable.
+------------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -184,15 +498,26 @@ def deploy_txt(api: BamApiClient, item: Dict[str, Any]) -> Tuple[str, str]:
     if planned not in {"create", "update", "delete"}:
         return "FAIL", f"Unsupported planned value: {planned}"
 
-    # MVP safety checks: plan must provide IDs
-    if not zone_id:
-        return "FAIL", "Missing zone_id in plan item (plan stage must resolve it)"
+    # Action-specific safety checks
+    if planned == "create":
+        if not zone_id:
+            return "FAIL", "Missing zone_id in plan item for create"
+
+    elif planned == "delete":
+        if not rr_id:
+            return "FAIL", "Missing details.rr_id for delete"
+
+    elif planned == "update":
+        if not rr_id:
+            return "FAIL", "Missing details.rr_id for update"
+        if not new_text:
+            return "FAIL", "Missing new_text for update"
 
     # Execute
     if planned == "create":
         # POST /api/v2/zones/<zone_id>/resourceRecords
         body = {
-            "type": "TXTRecord",     # BAM expects object type name (not 'txt')
+            "type": "TXTRecord",
             "name": name,
             "text": text,
         }
@@ -200,18 +525,11 @@ def deploy_txt(api: BamApiClient, item: Dict[str, Any]) -> Tuple[str, str]:
         return "OK", f"Created TXT (Change Control requested) view={view} zone={zone} name={name} text={text}"
 
     if planned == "delete":
-        if not rr_id:
-            return "FAIL", "Missing details.rr_id for delete"
         # DELETE /api/v2/resourceRecords/<rr_id>
         api.request("DELETE", f"/api/v2/resourceRecords/{rr_id}")
         return "OK", f"Deleted TXT (Change Control requested) id={rr_id} view={view} zone={zone} name={name} text={text}"
 
     # planned == "update"
-    if not rr_id:
-        return "FAIL", "Missing details.rr_id for update"
-    if not new_text:
-        return "FAIL", "Missing new_text for update"
-
     body = {
         "type": "TXTRecord",
         "name": name,
@@ -318,3 +636,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+  
