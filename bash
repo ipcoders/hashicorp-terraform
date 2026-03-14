@@ -1,25 +1,209 @@
 #!/usr/bin/env bash
+# ------------------------------------------------------------------------------
+# Script: discover_requests.sh
+#
+# Purpose
+# ------------------------------------------------------------------------------
+# This script analyzes a Git repository and determines which request files
+# under the `requests/` directory should be processed by downstream workflows.
+#
+# It compares a target commit (`--head`) against a base commit (`--base`),
+# detects file changes, and applies governance rules to files under the
+# `requests/` directory.
+#
+# The script produces:
+#
+#   1) A list of request YAML files detected in the change set
+#   2) A governance report describing all detected changes and violations
+#
+# This script is designed to run in CI pipelines to enforce repository
+# governance rules before further automation is executed.
+#
+#
+# ------------------------------------------------------------------------------
+# Comparison Logic
+# ------------------------------------------------------------------------------
+# The script compares two commits:
+#
+#   HEAD_REF  -> the commit being evaluated (required)
+#   BASE_REF  -> the commit to compare against (optional)
+#
+# If BASE_REF is not provided:
+#
+#   - If a previous commit exists, BASE_REF is automatically set to HEAD~1
+#   - If the repository only has one commit, the script compares against the
+#     empty tree and evaluates files introduced in the first commit.
+#
+#
+# ------------------------------------------------------------------------------
+# Change Detection
+# ------------------------------------------------------------------------------
+# The script retrieves changes using:
+#
+#   git diff --name-status BASE..HEAD
+#
+# or (for first commit):
+#
+#   git diff-tree --name-status HEAD
+#
+# Each change contains:
+#
+#   A = Added
+#   M = Modified
+#   D = Deleted
+#   R = Renamed
+#
+#
+# ------------------------------------------------------------------------------
+# Governance Rules (Current Implementation)
+# ------------------------------------------------------------------------------
+#
+# The following rules are applied ONLY to files under the `requests/` directory.
+#
+# Allowed:
+#
+#   - Added YAML files:
+#       requests/*.yml
+#       requests/*.yaml
+#
+#   - Modified YAML files:
+#       requests/*.yml
+#       requests/*.yaml
+#
+#   - Deleted files under requests/ (currently allowed and ignored).
+#
+#
+# Violations:
+#
+#   - Any rename operation involving the `requests/` directory.
+#
+#   - Any file added or modified under `requests/` that does NOT end in:
+#         .yml
+#         .yaml
+#
+#   - Any unexpected Git change type under `requests/`.
+#
+#
+# Files outside the `requests/` directory are logged in the report but are
+# NOT validated by governance rules.
+#
+#
+# ------------------------------------------------------------------------------
+# Outputs
+# ------------------------------------------------------------------------------
+#
+# 1) request_files.txt
+#
+#    Contains paths to request YAML files detected in the change set.
+#    These correspond to files under `requests/` that were Added or Modified
+#    and match the .yml/.yaml extension.
+#
+#    Format:
+#
+#       requests/example.yml
+#       requests/test.yaml
+#
+#
+# 2) governance_report.md
+#
+#    A human-readable Markdown report containing:
+#
+#       - Repository information
+#       - Commit SHAs used for comparison
+#       - Detected file changes
+#       - Governance violations
+#       - Summary of results
+#
+#
+# ------------------------------------------------------------------------------
+# Exit Codes
+# ------------------------------------------------------------------------------
+#
+# Exit 0
+#   Governance checks passed.
+#
+# Exit 3
+#   Governance violations detected.
+#
+# Exit 2
+#   Invalid arguments or usage error.
+#
+#
+# ------------------------------------------------------------------------------
+# Notes
+# ------------------------------------------------------------------------------
+#
+# - The repository is cloned fresh for every run to ensure deterministic
+#   behavior.
+#
+# - Deletions under `requests/` are currently allowed but ignored for request
+#   processing (MVP behavior).
+#
+# - Only YAML request files (.yml / .yaml) are collected for downstream
+#   processing.
+#
+# ------------------------------------------------------------------------------
+
 set -euo pipefail
 
 usage() {
-  cat <<'EOF'
+cat <<'EOF'
 Usage:
-  discover_requests.sh --repo-url <url> --head <ref> [--base <ref>] [--workdir <dir>] [--outdir <dir>]
+discover_requests.sh --repo-url <url> --head <ref> [--base <ref>] [--workdir <dir>] [--outdir <dir>]
 
-Args:
-  --repo-url   Git URL of bluecat_change_requests repo (required)
-  --head       Commit SHA or ref to evaluate as "new state" (required)
-  --base       Commit SHA or ref to compare against (optional; default: <head>~1)
-  --workdir    Working directory for clone (optional; default: .work/bluecat_change_requests)
-  --outdir     Output dir (optional; default: out)
+Purpose:
+Discover request YAML files under the `requests/` directory and enforce
+governance rules on repository changes.
+
+Required Arguments:
+--repo-url   Git URL of the repository to analyze
+--head       Commit SHA or ref representing the "new state" to evaluate
+
+Optional Arguments:
+--base       Commit SHA or ref to compare against
+Default: previous commit (<head>~1) if it exists
+If the repo has only one commit, the script compares against
+the empty tree.
+
+--workdir    Directory used to clone the repository
+Default: .work/bluecat_change_requests
+
+--outdir     Directory where output files will be written
+Default: out
 
 Behavior:
-  - Only allows ADDED files under requests/ with .yml/.yaml extension.
-  - Fails if any file under requests/ is Modified/Deleted/Renamed,
-    or if any non-yaml file is added under requests/.
+The script compares the HEAD commit with a BASE commit and analyzes
+the detected file changes.
+
+Governance rules apply ONLY to files under the `requests/` directory.
+
+Allowed:
+- Added YAML files (.yml or .yaml)
+- Modified YAML files (.yml or .yaml)
+- Deleted files under requests/ (currently allowed but ignored)
+
+Violations:
+- Any rename operation involving files under `requests/`
+- Any file added or modified under `requests/` that is NOT .yml/.yaml
+- Any unexpected Git change type under `requests/`
+
 Outputs:
-  - out/request_files.txt (ABSOLUTE paths)
-  - out/governance_report.md
+request_files.txt
+List of request YAML files detected in the change set.
+(files under requests/ that are Added or Modified).
+
+governance_report.md
+Markdown report containing:
+- repository information
+- resolved commit SHAs
+- detected changes
+- governance violations
+- summary of results
+
+Exit Codes:
+0   Governance checks passed
+2   Invalid arguments or usage error
+3   Governance violations detected
 EOF
 }
 
