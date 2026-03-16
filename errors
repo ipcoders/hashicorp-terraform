@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "/builds/mgic_devops/networking/dns/bluecat_automation/scripts/deploy_requests.py", line 330, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/builds/mgic_devops/networking/dns/bluecat_automation/scripts/deploy_requests.py", line 308, in main
+    status, msg = deploy_ipv4_network(api, it)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/builds/mgic_devops/networking/dns/bluecat_automation/scripts/deploy_requests.py", line 220, in deploy_ipv4_network
+    api.request("POST", f"/api/v2/blocks/{parent_block_id}/networks", json_body=body)
+  File "/builds/mgic_devops/networking/dns/bluecat_automation/scripts/deploy_requests.py", line 133, in request
+    resp.raise_for_status()
+  File "/usr/local/lib/python3.12/site-packages/requests/models.py", line 1026, in raise_for_status
+    raise HTTPError(http_error_msg, response=self)
+requests.exceptions.HTTPError: 409 Client Error: Conflict for url: https://1.1.1.1/api/v2/blocks/382830/networks
