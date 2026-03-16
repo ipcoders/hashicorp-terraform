@@ -1,38 +1,68 @@
-    def ipv4_blocks_containing_range(self, configuration_id: str, cidr: str) -> List[BlockRef]:
-        """
-        Return all blocks in the given configuration whose range fully contains the requested CIDR.
-        """
-        target = ipaddress.ip_network(cidr, strict=True)
+    def plan_ipv4_network(self, item: PlanItem) -> PlanItem:
+        if item.action != "create":
+            return self._fail(item, "ipv4_network currently supports only action=create")
 
-        data = self.api.request("GET", "/api/v2/blocks", params={"filter": "type:eq('IPv4Block')"})
-        items = data.get("data") or []
+        if not item.configuration_id:
+            return self._fail(item, f"Unsupported configuration name: {item.configuration}")
 
-        matches: List[BlockRef] = []
-        for item in items:
-            cfg = item.get("configuration") or {}
-            if str(cfg.get("id", "")) != str(configuration_id):
-                continue
+        # Exact requested parent block must exist
+        parent_blocks = self._safe_block_lookup(item.configuration_id, item.parent_block, item)
+        if parent_blocks is None:
+            return item
+        if len(parent_blocks) == 0:
+            return self._fail(item, "Parent block does not exist")
+        if self.cfg.fail_on_ambiguous_match and len(parent_blocks) > 1:
+            return self._fail(item, "Ambiguous match: more than one exact parent block found", {"match_count": len(parent_blocks)})
 
-            block_range = str(item.get("range", ""))
-            if not block_range:
-                continue
+        # Determine the most specific existing containing block for the requested range
+        containing_blocks = self._safe_containing_blocks_lookup(item.configuration_id, item.range, item)
+        if containing_blocks is None:
+            return item
+        if len(containing_blocks) == 0:
+            return self._fail(item, "No containing block exists for requested IPv4 network range")
 
-            try:
-                block_net = ipaddress.ip_network(block_range, strict=True)
-            except ValueError:
-                continue
+        try:
+            most_specific = min(
+                containing_blocks,
+                key=lambda b: ipaddress.ip_network(b.range, strict=True).num_addresses
+            )
+        except Exception as e:
+            return self._fail(item, f"Unable to determine most specific containing block: {e}")
 
-            if target.subnet_of(block_net):
-                matches.append(
-                    BlockRef(
-                        configuration_id=str(cfg.get("id", "")),
-                        configuration_name=str(cfg.get("name", "")),
-                        range=block_range,
-                        block_id=str(item["id"]),
-                    )
-                )
+        if most_specific.range != item.parent_block:
+            return self._fail(
+                item,
+                f"Requested parent block is not the most specific containing block; use parent_block={most_specific.range}",
+                {
+                    "requested_parent_block": item.parent_block,
+                    "most_specific_parent_block": most_specific.range,
+                    "most_specific_parent_block_id": most_specific.block_id,
+                },
+            )
 
-        return matches
+        item.parent_block_id = most_specific.block_id
+
+        same_range_blocks = self._safe_block_lookup(item.configuration_id, item.range, item)
+        if same_range_blocks is None:
+            return item
+        if len(same_range_blocks) > 0:
+            return self._fail(item, "Requested range already exists as a block", {"match_count": len(same_range_blocks)})
+
+        same_range_networks = self._safe_network_lookup(item.configuration_id, item.range, item)
+        if same_range_networks is None:
+            return item
+        if len(same_range_networks) > 0:
+            return self._skip(item, "Requested IPv4 network already exists; skipping create", {"match_count": len(same_range_networks)})
+
+        return self._create(
+            item,
+            "Parent block exists and requested IPv4 network does not exist; create is needed",
+            {
+                "parent_block_id": item.parent_block_id,
+                "configuration_id": item.configuration_id,
+                "range": item.range,
+            },
+        )
 
 
 
@@ -66,8 +96,3 @@ def deploy_ipv4_network(api: BamApiClient, item: Dict[str, Any]) -> Tuple[str, s
         return "FAIL", f"IPv4 network create failed: {e}"
 
     return "OK", f"Created IPv4 network configuration={configuration} parent_block_id={parent_block_id} range={requested_range}"
-
-    
-
-
-        
