@@ -1,0 +1,73 @@
+    def ipv4_blocks_containing_range(self, configuration_id: str, cidr: str) -> List[BlockRef]:
+        """
+        Return all blocks in the given configuration whose range fully contains the requested CIDR.
+        """
+        target = ipaddress.ip_network(cidr, strict=True)
+
+        data = self.api.request("GET", "/api/v2/blocks", params={"filter": "type:eq('IPv4Block')"})
+        items = data.get("data") or []
+
+        matches: List[BlockRef] = []
+        for item in items:
+            cfg = item.get("configuration") or {}
+            if str(cfg.get("id", "")) != str(configuration_id):
+                continue
+
+            block_range = str(item.get("range", ""))
+            if not block_range:
+                continue
+
+            try:
+                block_net = ipaddress.ip_network(block_range, strict=True)
+            except ValueError:
+                continue
+
+            if target.subnet_of(block_net):
+                matches.append(
+                    BlockRef(
+                        configuration_id=str(cfg.get("id", "")),
+                        configuration_name=str(cfg.get("name", "")),
+                        range=block_range,
+                        block_id=str(item["id"]),
+                    )
+                )
+
+        return matches
+
+
+
+# DEPLOY
+def deploy_ipv4_network(api: BamApiClient, item: Dict[str, Any]) -> Tuple[str, str]:
+    planned = _as_str(item.get("planned")).lower()
+    parent_block_id = _as_str(item.get("parent_block_id")).strip()
+    requested_range = _as_str(item.get("range")).strip()
+    configuration = _as_str(item.get("configuration")).strip()
+
+    if planned == "skip":
+        return "SKIP", _as_str(item.get("reason")) or "planned=skip"
+    if planned == "fail":
+        return "FAIL", _as_str(item.get("reason")) or "planned=fail"
+    if planned != "create":
+        return "FAIL", f"ipv4_network supports only planned=create in MVP (got: {planned})"
+
+    if not parent_block_id:
+        return "FAIL", "Missing parent_block_id in plan item for ipv4_network create"
+    if not requested_range:
+        return "FAIL", "Missing range in plan item for ipv4_network create"
+
+    body = {
+        "type": "IPv4Network",
+        "range": requested_range,
+    }
+
+    try:
+        api.request("POST", f"/api/v2/blocks/{parent_block_id}/networks", json_body=body)
+    except requests.exceptions.HTTPError as e:
+        return "FAIL", f"IPv4 network create failed: {e}"
+
+    return "OK", f"Created IPv4 network configuration={configuration} parent_block_id={parent_block_id} range={requested_range}"
+
+    
+
+
+        
