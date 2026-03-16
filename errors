@@ -52,3 +52,12 @@ requests.exceptions.HTTPError: 409 Client Error: Conflict for url: https://1.1.1
     }
   ]
 }
+
+x-bcn-traversal-method
+string
+(header)
+The algorithm used to determine the starting address of the network when only a size was provided for the range value. If no header value is supplied, NO_TRAVERSAL will be used by default.
+
+NO_TRAVERSAL: Attempt to find the available space directly under the specified parent block.
+DEPTH_FIRST: Attempt to find the available space by recursively searching the parent block's children.
+BREADTH_FIRST: Attempt to find the available space by iteratively searching each level of the block's children.
