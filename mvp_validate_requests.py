@@ -64,7 +64,6 @@ def write_text(path: Path, content: str) -> None:
 CONFIGURATION_IDS: Dict[str, str] = {
     "dre": "291883",
     "mgic int": "100887",
-    "mgic_int": "100887",
 }
 
 
@@ -655,10 +654,30 @@ def render_plan_report(plan_items: List[PlanItem], counts: Dict[str, int]) -> st
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--in", dest="input_path", required=True, help="Input normalized_requests.json")
+    parser.add_argument("files", nargs="+", help="Request YAML files.")
+    parser.add_argument("--in", dest="input_files", nargs="+", default=None, help="Request YAML files to validate.")
     parser.add_argument("--out", dest="out_dir", default="out", help="Output directory (default: out)")
     args = parser.parse_args()
 
+    all_files: List[str] = []
+    if args.files:
+        all_files.extend(args.files)
+
+    if args.input_files:
+        all_files.extend(args.input_files)
+
+    # Ensure at least one file was provided
+    if not all_files:
+        parser.error("at least one request YAML file must be provided.")
+
+    # Deduplicate while preserving order
+    seen = set()
+    files: List[str] = []
+    for f in all_files:
+        if f not in seen:
+            seen.add(f)
+            files.append(f)
+            
     in_path = Path(args.input_path)
     out_dir = Path(args.out_dir)
 
