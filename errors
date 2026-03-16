@@ -12,3 +12,43 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.12/site-packages/requests/models.py", line 1026, in raise_for_status
     raise HTTPError(http_error_msg, response=self)
 requests.exceptions.HTTPError: 409 Client Error: Conflict for url: https://1.1.1.1/api/v2/blocks/382830/networks
+
+
+
+{
+  "generated_at": "2026-03-16T04:12:05Z",
+  "counts": {
+    "create": 1,
+    "update": 0,
+    "delete": 0,
+    "skip": 0,
+    "fail": 0
+  },
+  "items": [
+    {
+      "request_key": "requests/request05.yml",
+      "user_email": "ernesto@mgic.com",
+      "labels": [],
+      "view": "",
+      "type": "ipv4_network",
+      "zone": "",
+      "name": "",
+      "action": "create",
+      "text": "",
+      "planned": "create",
+      "reason": "Parent block exists and requested IPv4 network does not exist; create is needed",
+      "details": {
+        "parent_block_id": "382830",
+        "configuration_id": "100887",
+        "range": "192.169.64.0/18"
+      },
+      "new_text": null,
+      "zone_id": null,
+      "configuration": "MGIC INT",
+      "configuration_id": "100887",
+      "parent_block": "192.169.0.0/16",
+      "parent_block_id": "382830",
+      "range": "192.169.64.0/18"
+    }
+  ]
+}
