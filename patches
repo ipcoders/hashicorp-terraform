@@ -1,98 +1,39 @@
-    def plan_ipv4_network(self, item: PlanItem) -> PlanItem:
-        if item.action != "create":
-            return self._fail(item, "ipv4_network currently supports only action=create")
+def ipv4_network_container_match(self, configuration_id: str, cidr: str) -> List[NetworkRef]:
+    flt = f"type:eq('IPv4Network') and range:eq('{cidr}')"
+    data = self.api.request("GET", "/api/v2/networks", params={"filter": flt})
 
-        if not item.configuration_id:
-            return self._fail(item, f"Unsupported configuration name: {item.configuration}")
+    items = data.get("data") or []
+    matches: List[NetworkRef] = []
 
-        # Exact requested parent block must exist
-        parent_blocks = self._safe_block_lookup(item.configuration_id, item.parent_block, item)
-        if parent_blocks is None:
-            return item
-        if len(parent_blocks) == 0:
-            return self._fail(item, "Parent block does not exist")
-        if self.cfg.fail_on_ambiguous_match and len(parent_blocks) > 1:
-            return self._fail(item, "Ambiguous match: more than one exact parent block found", {"match_count": len(parent_blocks)})
+    for item in items:
+        cfg = item.get("configuration") or {}
+        if str(cfg.get("id", "")) != str(configuration_id):
+            continue
 
-        # Determine the most specific existing containing block for the requested range
-        containing_blocks = self._safe_containing_blocks_lookup(item.configuration_id, item.range, item)
-        if containing_blocks is None:
-            return item
-        if len(containing_blocks) == 0:
-            return self._fail(item, "No containing block exists for requested IPv4 network range")
-
-        try:
-            most_specific = min(
-                containing_blocks,
-                key=lambda b: ipaddress.ip_network(b.range, strict=True).num_addresses
+        matches.append(
+            NetworkRef(
+                configuration_id=str(cfg.get("id", "")),
+                configuration_name=str(cfg.get("name", "")),
+                range=str(item.get("range", "")),
+                network_id=str(item["id"]),
             )
-        except Exception as e:
-            return self._fail(item, f"Unable to determine most specific containing block: {e}")
-
-        if most_specific.range != item.parent_block:
-            return self._fail(
-                item,
-                f"Requested parent block is not the most specific containing block; use parent_block={most_specific.range}",
-                {
-                    "requested_parent_block": item.parent_block,
-                    "most_specific_parent_block": most_specific.range,
-                    "most_specific_parent_block_id": most_specific.block_id,
-                },
-            )
-
-        item.parent_block_id = most_specific.block_id
-
-        same_range_blocks = self._safe_block_lookup(item.configuration_id, item.range, item)
-        if same_range_blocks is None:
-            return item
-        if len(same_range_blocks) > 0:
-            return self._fail(item, "Requested range already exists as a block", {"match_count": len(same_range_blocks)})
-
-        same_range_networks = self._safe_network_lookup(item.configuration_id, item.range, item)
-        if same_range_networks is None:
-            return item
-        if len(same_range_networks) > 0:
-            return self._skip(item, "Requested IPv4 network already exists; skipping create", {"match_count": len(same_range_networks)})
-
-        return self._create(
-            item,
-            "Parent block exists and requested IPv4 network does not exist; create is needed",
-            {
-                "parent_block_id": item.parent_block_id,
-                "configuration_id": item.configuration_id,
-                "range": item.range,
-            },
         )
 
+    return matches
 
 
-# DEPLOY
-def deploy_ipv4_network(api: BamApiClient, item: Dict[str, Any]) -> Tuple[str, str]:
-    planned = _as_str(item.get("planned")).lower()
-    parent_block_id = _as_str(item.get("parent_block_id")).strip()
-    requested_range = _as_str(item.get("range")).strip()
-    configuration = _as_str(item.get("configuration")).strip()
+parent_blocks = self._safe_block_lookup(item.configuration_id, item.parent_block, item)
+if parent_blocks is None:
+    return item
 
-    if planned == "skip":
-        return "SKIP", _as_str(item.get("reason")) or "planned=skip"
-    if planned == "fail":
-        return "FAIL", _as_str(item.get("reason")) or "planned=fail"
-    if planned != "create":
-        return "FAIL", f"ipv4_network supports only planned=create in MVP (got: {planned})"
+if len(parent_blocks) == 0:
+    # Check if it exists as a network instead
+    parent_networks = self._safe_network_lookup(item.configuration_id, item.parent_block, item)
+    if parent_networks:
+        return self._fail(
+            item,
+            f"Invalid parent_block: {item.parent_block} exists as an IPv4Network, not an IPv4Block. "
+            "IPv4 networks can only be created under blocks.",
+        )
 
-    if not parent_block_id:
-        return "FAIL", "Missing parent_block_id in plan item for ipv4_network create"
-    if not requested_range:
-        return "FAIL", "Missing range in plan item for ipv4_network create"
-
-    body = {
-        "type": "IPv4Network",
-        "range": requested_range,
-    }
-
-    try:
-        api.request("POST", f"/api/v2/blocks/{parent_block_id}/networks", json_body=body)
-    except requests.exceptions.HTTPError as e:
-        return "FAIL", f"IPv4 network create failed: {e}"
-
-    return "OK", f"Created IPv4 network configuration={configuration} parent_block_id={parent_block_id} range={requested_range}"
+    return self._fail(item, f"Parent block {item.parent_block} does not exist")
