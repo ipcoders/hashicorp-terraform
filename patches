@@ -25,3 +25,57 @@ curl -k -sS -X DELETE "https://10.64.216.192/api/v2/addresses/382868" -H "Conten
 # Verification after deletion
 curl -k -sS -X GET "https://10.64.216.192/api/v2/networks/382858/addresses?filter=address:eq('192.170.0.50')" -H "Content-Type: application/json" -H "Authorization: Basic YWRtaW46R2xzWWZGMkxnRlhTellmQTVTdTdhZit4U0hubWZTZm1ta1Vrb1RzOA=="
 {"count":0,"data":[]}
+
+
+# Create an IP address out of a network
+curl -X 'POST' \
+  'https://1.1.1.1/api/v2/networks/131642/addresses' \
+  -H 'x-bcn-create-reverse-record: false' \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "type": "IPv4Address",
+  "state": "STATIC",
+  "address": "12.125.235.168"
+}'
+
+{
+  "status": 400,
+  "reason": "Bad Request",
+  "code": "AddressNotInNetwork",
+  "message": "The provided address does not reside within the given network"
+}
+
+# Create an IP address that already exists in a network
+curl -X 'POST' \
+  'https://10.64.216.192/api/v2/networks/131642/addresses' \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "type": "IPv4Address",
+  "state": "STATIC",
+  "address": "12.125.235.166"
+}'
+{
+  "status": 409,
+  "reason": "Conflict",
+  "code": "ResourceAlreadyExists",
+  "message": "The request attempted to create a resource that already exists",
+  "detail": "Duplicate of another item"
+}
+
+# Create the next available IP address in a network that is already full
+curl -X 'POST' \
+  'https://10.64.216.192/api/v2/networks/131642/addresses' \
+  -H 'x-bcn-create-reverse-record: false' \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "type": "IPv4Address",
+  "state": "STATIC"
+}'
+
+{
+  "status": 400,
+  "reason": "Bad Request",
+  "code": "NoSpaceForAddress",
+  "message": "The network has no available addresses to assign",
+  "detail": "No unassigned address found in the selected range."
+}
