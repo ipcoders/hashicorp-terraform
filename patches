@@ -1,81 +1,66 @@
+# Explicit create, single IP
+user_email: ""
+actions:
+  - action: "create"
+    ipam:
+      - type: "ipv4_address"
+        configuration: ""
+        parent_network: "192.170.0.0/18"
+        addresses:
+          - "192.170.0.60"
 
-# Retrieve a collection of all addresses for a network.
-curl -k -sS -X GET "https://10.64.216.192/api/v2/networks/382858/addresses" -H "Content-Type: application/json" -H "Authorization: Basic YWRtaW46R2xzWWZGMkxnRlhTellmQTVTdTdhZit4U0hubWZTZm1ta1Vrb1RzOA=="
-{"count":3,"data":[{"id":382859,"type":"IPv4Address","name":null,"configuration":{"id":100887,"type":"Configuration","name":"MGIC INT","_links":{"self":{"href":"/api/v2/configurations/100887"}}},"address":"192.170.0.1","state":"GATEWAY","macAddress":null,"template":null,"location":null,"clientIdentifier":null,"device":null,"leaseDateTime":null,"leaseExpirationDateTime":null,"circuitId":null,"remoteId":null,"parameterRequestList":[],"vendorClassIdentifier":null,"routerPortInfo":null,"switchPortInfo":null,"vlanInfo":null,"ipGroup":null,"userDefinedFields":null,"_links":{"self":{"href":"/api/v2/addresses/382859"},"collection":{"href":"/api/v2/networks/382858/addresses"},"up":{"href":"/api/v2/networks/382858"},"leases":{"href":"/api/v2/addresses/382859/leases"},"resourceRecords":{"href":"/api/v2/addresses/382859/resourceRecords"},"deploymentOptions":{"href":"/api/v2/addresses/382859/deploymentOptions"},"moves":{"href":"/api/v2/addresses/382859/moves"},"templateApplications":{"href":"/api/v2/addresses/382859/templateApplications"},"workflowRequests":{"href":"/api/v2/addresses/382859/workflowRequests"},"tags":{"href":"/api/v2/addresses/382859/tags"},"accessRights":{"href":"/api/v2/addresses/382859/accessRights"},"transactions":{"href":"/api/v2/addresses/382859/transactions"},"userDefinedLinks":{"href":"/api/v2/addresses/382859/userDefinedLinks"}}},{"id":382866,"type":"IPv4Address","name":null,"configuration":{"id":100887,"type":"Configuration","name":"MGIC INT","_links":{"self":{"href":"/api/v2/configurations/100887"}}},"address":"192.170.0.2","state":"STATIC","macAddress":null,"template":null,"location":null,"clientIdentifier":null,"device":null,"leaseDateTime":null,"leaseExpirationDateTime":null,"circuitId":null,"remoteId":null,"parameterRequestList":[],"vendorClassIdentifier":null,"routerPortInfo":null,"switchPortInfo":null,"vlanInfo":null,"ipGroup":null,"userDefinedFields":null,"_links":{"self":{"href":"/api/v2/addresses/382866"},"collection":{"href":"/api/v2/networks/382858/addresses"},"up":{"href":"/api/v2/networks/382858"},"leases":{"href":"/api/v2/addresses/382866/leases"},"resourceRecords":{"href":"/api/v2/addresses/382866/resourceRecords"},"deploymentOptions":{"href":"/api/v2/addresses/382866/deploymentOptions"},"moves":{"href":"/api/v2/addresses/382866/moves"},"templateApplications":{"href":"/api/v2/addresses/382866/templateApplications"},"workflowRequests":{"href":"/api/v2/addresses/382866/workflowRequests"},"tags":{"href":"/api/v2/addresses/382866/tags"},"accessRights":{"href":"/api/v2/addresses/382866/accessRights"},"transactions":{"href":"/api/v2/addresses/382866/transactions"},"userDefinedLinks":{"href":"/api/v2/addresses/382866/userDefinedLinks"}}},{"id":382867,"type":"IPv4Address","name":"Server C0110","configuration":{"id":100887,"type":"Configuration","name":"MGIC INT","_links":{"self":{"href":"/api/v2/configurations/100887"}}},"address":"192.170.0.51","state":"STATIC","macAddress":null,"template":null,"location":null,"clientIdentifier":null,"device":null,"leaseDateTime":null,"leaseExpirationDateTime":null,"circuitId":null,"remoteId":null,"parameterRequestList":[],"vendorClassIdentifier":null,"routerPortInfo":null,"switchPortInfo":null,"vlanInfo":null,"ipGroup":null,"userDefinedFields":null,"_links":{"self":{"href":"/api/v2/addresses/382867"},"collection":{"href":"/api/v2/networks/382858/addresses"},"up":{"href":"/api/v2/networks/382858"},"leases":{"href":"/api/v2/addresses/382867/leases"},"resourceRecords":{"href":"/api/v2/addresses/382867/resourceRecords"},"deploymentOptions":{"href":"/api/v2/addresses/382867/deploymentOptions"},"moves":{"href":"/api/v2/addresses/382867/moves"},"templateApplications":{"href":"/api/v2/addresses/382867/templateApplications"},"workflowRequests":{"href":"/api/v2/addresses/382867/workflowRequests"},"tags":{"href":"/api/v2/addresses/382867/tags"},"accessRights":{"href":"/api/v2/addresses/382867/accessRights"},"transactions":{"href":"/api/v2/addresses/382867/transactions"},"userDefinedLinks":{"href":"/api/v2/addresses/382867/userDefinedLinks"}}}]}
+Expected:
+  validate: pass
+  plan: create
+  deploy: OK
 
-# Retrieve a collection of available IPv4/IPv6 addresses within an IPv4/IPv6 network, I had to use a filter because this network returned a lot of output, but you get the idea.
-curl -k -sS -X GET "https://10.64.216.192/api/v2/networks/382858/availableAddresses?limit=2" -H "Content-Type: application/json" -H "Authorization: Basic YWRtaW46R2xzWWZGMkxnRlhTellmQTVTdTdhZit4U0hubWZTZm1ta1Vrb1RzOA=="
-{"count":2,"_links":{"next":{"href":"/api/v2/networks/382858/availableAddresses?offset=2&limit=2"}},"data":[{"id":1,"address":"192.170.0.3","_links":{"self":{"href":"/api/v2/availableAddresses/1"},"collection":{"href":"/api/v2/networks/382858/availableAddresses"},"up":{"href":"/api/v2/networks/382858"}}},{"id":2,"address":"192.170.0.4","_links":{"self":{"href":"/api/v2/availableAddresses/2"},"collection":{"href":"/api/v2/networks/382858/availableAddresses"},"up":{"href":"/api/v2/networks/382858"}}}]}
+# Explicit create, multiple IPs
+user_email: ""
+actions:
+  - action: "create"
+    ipam:
+      - type: "ipv4_address"
+        configuration: ""
+        parent_network: "192.170.0.0/18"
+        addresses:
+          - "192.170.0.61"
+          - "192.170.0.62"
+          - "192.170.0.63"
 
-# Create\Assign IPv4 Address within an existing network.
-curl -k -sS -X POST "https://10.64.216.192/api/v2/networks/382858/addresses" -H "Content-Type: application/json" -H "Authorization: Basic YWRtaW46R2xzWWZGMkxnRlhTellmQTVTdTdhZit4U0hubWZTZm1ta1Vrb1RzOA==" -d "{\"type\":\"IPv4Address\",\"state\":\"STATIC\",\"address\":\"192.170.0.50\"}"
-{"id":382868,"type":"IPv4Address","name":null,"configuration":{"id":100887,"type":"Configuration","name":"MGIC INT","_links":{"self":{"href":"/api/v2/configurations/100887"}}},"address":"192.170.0.50","state":"STATIC","macAddress":null,"template":null,"location":null,"clientIdentifier":null,"device":null,"leaseDateTime":null,"leaseExpirationDateTime":null,"circuitId":null,"remoteId":null,"parameterRequestList":[],"vendorClassIdentifier":null,"routerPortInfo":null,"switchPortInfo":null,"vlanInfo":null,"ipGroup":null,"userDefinedFields":null,"_links":{"self":{"href":"/api/v2/addresses/382868"},"collection":{"href":"/api/v2/networks/382858/addresses"},"up":{"href":"/api/v2/networks/382858"},"leases":{"href":"/api/v2/addresses/382868/leases"},"resourceRecords":{"href":"/api/v2/addresses/382868/resourceRecords"},"deploymentOptions":{"href":"/api/v2/addresses/382868/deploymentOptions"},"moves":{"href":"/api/v2/addresses/382868/moves"},"templateApplications":{"href":"/api/v2/addresses/382868/templateApplications"},"workflowRequests":{"href":"/api/v2/addresses/382868/workflowRequests"},"tags":{"href":"/api/v2/addresses/382868/tags"},"accessRights":{"href":"/api/v2/addresses/382868/accessRights"},"transactions":{"href":"/api/v2/addresses/382868/transactions"},"userDefinedLinks":{"href":"/api/v2/addresses/382868/userDefinedLinks"}}}
+Expected:
+  validate: pass
+  plan: 3 create items
+  deploy: 3 OK
 
-# if IP is already created or assigned, the API POST call returns
-curl -k -sS -X POST "https://10.64.216.192/api/v2/networks/382858/addresses" -H "Content-Type: application/json" -H "Authorization: Basic YWRtaW46R2xzWWZGMkxnRlhTellmQTVTdTdhZit4U0hubWZTZm1ta1Vrb1RzOA==" -d "{\"type\":\"IPv4Address\",\"state\":\"STATIC\",\"address\":\"192.170.0.50\"}"
-{"status":409,"reason":"Conflict","code":"ResourceAlreadyExists","message":"The request attempted to create a resource that already exists","detail":"Duplicate of another item"}
+# Explicit create, duplicate existing IP
+user_email: "user@mgic.com"
+actions:
+  - action: "create"
+    ipam:
+      - type: "ipv4_address"
+        configuration: "MGIC INT"
+        parent_network: "192.170.0.0/18"
+        addresses:
+          - "192.170.0.2"
 
-# Retrieve a specific IP address from existing network with a filter and without knowing the IP ID.
-curl -k -sS -X GET "https://10.64.216.192/api/v2/networks/382858/addresses?filter=address:eq('192.170.0.50')" -H "Content-Type: application/json" -H "Authorization: Basic YWRtaW46R2xzWWZGMkxnRlhTellmQTVTdTdhZit4U0hubWZTZm1ta1Vrb1RzOA=="
-{"count":1,"data":[{"id":382868,"type":"IPv4Address","name":null,"configuration":{"id":100887,"type":"Configuration","name":"MGIC INT","_links":{"self":{"href":"/api/v2/configurations/100887"}}},"address":"192.170.0.50","state":"STATIC","macAddress":null,"template":null,"location":null,"clientIdentifier":null,"device":null,"leaseDateTime":null,"leaseExpirationDateTime":null,"circuitId":null,"remoteId":null,"parameterRequestList":[],"vendorClassIdentifier":null,"routerPortInfo":null,"switchPortInfo":null,"vlanInfo":null,"ipGroup":null,"userDefinedFields":null,"_links":{"self":{"href":"/api/v2/addresses/382868"},"collection":{"href":"/api/v2/networks/382858/addresses"},"up":{"href":"/api/v2/networks/382858"},"leases":{"href":"/api/v2/addresses/382868/leases"},"resourceRecords":{"href":"/api/v2/addresses/382868/resourceRecords"},"deploymentOptions":{"href":"/api/v2/addresses/382868/deploymentOptions"},"moves":{"href":"/api/v2/addresses/382868/moves"},"templateApplications":{"href":"/api/v2/addresses/382868/templateApplications"},"workflowRequests":{"href":"/api/v2/addresses/382868/workflowRequests"},"tags":{"href":"/api/v2/addresses/382868/tags"},"accessRights":{"href":"/api/v2/addresses/382868/accessRights"},"transactions":{"href":"/api/v2/addresses/382868/transactions"},"userDefinedLinks":{"href":"/api/v2/addresses/382868/userDefinedLinks"}}}]}
-
-# Free up\Unassign IP which does not return any output, therefore, I verified it by querying the IP again after deletion.
-curl -k -sS -X DELETE "https://10.64.216.192/api/v2/addresses/382868" -H "Content-Type: application/json" -H "Authorization: Basic YWRtaW46R2xzWWZGMkxnRlhTellmQTVTdTdhZit4U0hubWZTZm1ta1Vrb1RzOA=="
-
-# Verification after deletion
-curl -k -sS -X GET "https://10.64.216.192/api/v2/networks/382858/addresses?filter=address:eq('192.170.0.50')" -H "Content-Type: application/json" -H "Authorization: Basic YWRtaW46R2xzWWZGMkxnRlhTellmQTVTdTdhZit4U0hubWZTZm1ta1Vrb1RzOA=="
-{"count":0,"data":[]}
+Expected:
+  validate: pass
+  plan: fail
+  deploy: not run
 
 
-# Create an IP address out of a network
-curl -X 'POST' \
-  'https://1.1.1.1/api/v2/networks/131642/addresses' \
-  -H 'x-bcn-create-reverse-record: false' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "type": "IPv4Address",
-  "state": "STATIC",
-  "address": "12.125.235.168"
-}'
+# Explicit create, IP outside parent network
+user_email: "user@mgic.com"
+actions:
+  - action: "create"
+    ipam:
+      - type: "ipv4_address"
+        configuration: "MGIC INT"
+        parent_network: "192.170.0.0/18"
+        addresses:
+          - "192.170.64.10"
 
-{
-  "status": 400,
-  "reason": "Bad Request",
-  "code": "AddressNotInNetwork",
-  "message": "The provided address does not reside within the given network"
-}
-
-# Create an IP address that already exists in a network
-curl -X 'POST' \
-  'https://10.64.216.192/api/v2/networks/131642/addresses' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "type": "IPv4Address",
-  "state": "STATIC",
-  "address": "12.125.235.166"
-}'
-{
-  "status": 409,
-  "reason": "Conflict",
-  "code": "ResourceAlreadyExists",
-  "message": "The request attempted to create a resource that already exists",
-  "detail": "Duplicate of another item"
-}
-
-# Create the next available IP address in a network that is already full
-curl -X 'POST' \
-  'https://10.64.216.192/api/v2/networks/131642/addresses' \
-  -H 'x-bcn-create-reverse-record: false' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "type": "IPv4Address",
-  "state": "STATIC"
-}'
-
-{
-  "status": 400,
-  "reason": "Bad Request",
-  "code": "NoSpaceForAddress",
-  "message": "The network has no available addresses to assign",
-  "detail": "No unassigned address found in the selected range."
-}
+Expected:
+  validate: pass
+  plan: fail
+  deploy: not run
