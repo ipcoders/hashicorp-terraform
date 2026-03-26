@@ -7,6 +7,12 @@ Current supported objects:
   - TXT only
 - ipam:
   - IPv4 network (create only)
+  - IPv4 address
+    - create:
+      - explicit addresses
+      - next available addresses
+    - delete:
+      - explicit addresses
 
 This stage validates structure and normalizes input only.
 It does NOT talk to BlueCat and does NOT make state-aware decisions.
@@ -19,7 +25,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import yaml
 from pydantic import BaseModel, EmailStr, Field, ValidationError, field_validator, model_validator
@@ -35,7 +41,7 @@ def now_iso() -> str:
 # -----------------------------
 
 RecordType = Literal["txt"]
-IpamType = Literal["ipv4_network"]
+IpamType = Literal["ipv4_network", "ipv4_address"]
 ActionType = Literal["create", "update", "delete"]
 
 
@@ -69,7 +75,7 @@ class IPv4NetworkObject(BaseModel):
     - parent_block: existing parent block range in CIDR form
     - range: desired network CIDR
     """
-    type: IpamType = Field(..., description="IPAM object type (MVP: ipv4_network)")
+    type: Literal["ipv4_network"] = Field(..., description="IPAM object type (MVP: ipv4_network)")
     configuration: str = Field(..., min_length=1, description="Configuration name (e.g. DRE, MGIC INT)")
     parent_block: str = Field(..., min_length=1, description="Existing parent block range (e.g. 192.169.0.0/16)")
     range: str = Field(..., min_length=1, description="Desired IPv4 network range (e.g. 192.169.64.0/18)")
@@ -85,17 +91,92 @@ class IPv4NetworkObject(BaseModel):
         return v.strip() if isinstance(v, str) else v
 
 
+class IPv4AddressObject(BaseModel):
+    """
+    IPv4 address request.
+
+    Supported patterns:
+    - create with explicit addresses
+    - create with next available addresses
+    - delete with explicit addresses
+    """
+    type: Literal["ipv4_address"] = Field(..., description="IPAM object type (MVP: ipv4_address)")
+    configuration: str = Field(..., min_length=1, description="Configuration name (e.g. DRE, MGIC INT)")
+    parent_network: str = Field(..., min_length=1, description="Existing parent network range (e.g. 192.170.0.0/18)")
+    addresses: List[str] = Field(default_factory=list, description="Explicit IPv4 addresses")
+    next_available_addresses: Optional[bool] = Field(
+        None,
+        description="If true, request next available IPv4 addresses inside the parent network"
+    )
+    next_available_count: Optional[int] = Field(
+        None,
+        description="Number of next available IPv4 addresses to request (default: 1, max: 10)"
+    )
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def normalize_type(cls, v: Any) -> Any:
+        return v.strip().lower() if isinstance(v, str) else v
+
+    @field_validator("configuration", "parent_network", mode="before")
+    @classmethod
+    def strip_strings(cls, v: Any) -> Any:
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("addresses", mode="before")
+    @classmethod
+    def normalize_addresses(cls, v: Any) -> Any:
+        if v is None:
+            return []
+        return v
+
+    @field_validator("addresses")
+    @classmethod
+    def validate_addresses(cls, v: List[Any]) -> List[str]:
+        if not isinstance(v, list):
+            raise ValueError("addresses must be a list of non-empty strings")
+        cleaned: List[str] = []
+        for item in v:
+            if not isinstance(item, str) or item.strip() == "":
+                raise ValueError("addresses must contain only non-empty strings")
+            cleaned.append(item.strip())
+        return cleaned
+
+    @field_validator("next_available_addresses", mode="before")
+    @classmethod
+    def normalize_next_available_flag(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            lowered = v.strip().lower()
+            if lowered in {"true", "yes"}:
+                return True
+            if lowered in {"false", "no"}:
+                return False
+        return v
+
+    @field_validator("next_available_count", mode="before")
+    @classmethod
+    def normalize_next_available_count(cls, v: Any) -> Any:
+        if v == "":
+            return None
+        return v
+
+
+IpamObject = Union[IPv4NetworkObject, IPv4AddressObject]
+
+
 class Action(BaseModel):
     """
     One group of requested operations.
 
     Current supported sections:
     - records: TXT record operations
-    - ipam: IPv4 network operations (create only for MVP)
+    - ipam:
+      - ipv4_network (create only)
+      - ipv4_address (create/delete)
     """
     action: ActionType
     records: List[TXTRecord] = Field(default_factory=list)
-    ipam: List[IPv4NetworkObject] = Field(default_factory=list)
+    ipam: List[IpamObject] = Field(default_factory=list)
     view: str = Field(default="internal")
     labels: List[str] = Field(default_factory=list)
 
@@ -152,11 +233,29 @@ class Action(BaseModel):
             - new_text MUST NOT be provided
 
         IPAM rules:
-          - current MVP supports only action=create for ipam objects
+          ipv4_network:
+            - supports only action=create
+
+          ipv4_address:
+            create manual mode:
+              - addresses required
+              - next_available_addresses forbidden
+              - next_available_count forbidden
+
+            create next-available mode:
+              - next_available_addresses must be true
+              - addresses must be empty
+              - next_available_count default=1, max=10
+
+            delete:
+              - addresses required
+              - next_available_addresses forbidden
+              - next_available_count forbidden
         """
         if not self.records and not self.ipam:
             raise ValueError("each action must contain at least one non-empty section: records or ipam")
 
+        # TXT validation
         for idx, r in enumerate(self.records):
             if self.action in ("create", "delete"):
                 if r.new_text is not None and r.new_text != "":
@@ -166,8 +265,60 @@ class Action(BaseModel):
                 if r.new_text is None or r.new_text.strip() == "":
                     raise ValueError(f"records[{idx}].new_text is required for action: update")
 
-        if self.ipam and self.action != "create":
-            raise ValueError("ipam objects currently support only action: create")
+        # IPAM validation
+        for idx, obj in enumerate(self.ipam):
+            if isinstance(obj, IPv4NetworkObject):
+                if self.action != "create":
+                    raise ValueError("ipv4_network currently supports only action: create")
+
+            elif isinstance(obj, IPv4AddressObject):
+                if self.action == "create":
+                    has_addresses = len(obj.addresses) > 0
+                    wants_next = obj.next_available_addresses is True
+
+                    if has_addresses and wants_next:
+                        raise ValueError(
+                            f"ipam[{idx}] for ipv4_address cannot use both addresses and next_available_addresses"
+                        )
+
+                    if has_addresses:
+                        if obj.next_available_count is not None:
+                            raise ValueError(
+                                f"ipam[{idx}].next_available_count is not allowed when addresses are provided"
+                            )
+                        if obj.next_available_addresses not in (None, False):
+                            raise ValueError(
+                                f"ipam[{idx}].next_available_addresses must not be true when addresses are provided"
+                            )
+
+                    elif wants_next:
+                        if obj.next_available_count is None:
+                            obj.next_available_count = 1
+                        if obj.next_available_count < 1:
+                            raise ValueError(f"ipam[{idx}].next_available_count must be at least 1")
+                        if obj.next_available_count > 10:
+                            raise ValueError(f"ipam[{idx}].next_available_count must not exceed 10")
+
+                    else:
+                        raise ValueError(
+                            f"ipam[{idx}] for ipv4_address create must use either explicit addresses "
+                            f"or next_available_addresses: true"
+                        )
+
+                elif self.action == "delete":
+                    if not obj.addresses:
+                        raise ValueError(f"ipam[{idx}].addresses is required for ipv4_address delete")
+                    if obj.next_available_addresses not in (None, False):
+                        raise ValueError(
+                            f"ipam[{idx}].next_available_addresses is not allowed for ipv4_address delete"
+                        )
+                    if obj.next_available_count is not None:
+                        raise ValueError(
+                            f"ipam[{idx}].next_available_count is not allowed for ipv4_address delete"
+                        )
+
+                else:
+                    raise ValueError("ipv4_address currently supports only action: create or delete")
 
         return self
 
@@ -186,15 +337,23 @@ class RequestFile(BaseModel):
 
         IPv4 network key:
           (configuration, parent_block, range, type)
+
+        IPv4 address explicit key:
+          (configuration, parent_network, address, type)
         """
         created: set[Tuple[str, str, str, str, str]] = set()
         deleted: set[Tuple[str, str, str, str, str]] = set()
         updated_to: Dict[Tuple[str, str, str, str, str], str] = {}
 
         seen_dupes: set = set()
-        seen_ipam_creates: set[Tuple[str, str, str, str]] = set()
+        seen_ipam_network_creates: set[Tuple[str, str, str, str]] = set()
+
+        created_ipv4_addresses: set[Tuple[str, str, str, str]] = set()
+        deleted_ipv4_addresses: set[Tuple[str, str, str, str]] = set()
+        seen_next_available_requests: set[Tuple[str, str, int, str]] = set()
 
         for a in self.actions:
+            # TXT checks
             for r in a.records:
                 item_key = (a.view, r.zone, r.name, r.type, r.text)
 
@@ -227,11 +386,48 @@ class RequestFile(BaseModel):
                         )
                     updated_to[item_key] = new_val
 
-            for net in a.ipam:
-                net_key = (net.configuration, net.parent_block, net.range, net.type)
-                if net_key in seen_ipam_creates:
-                    raise ValueError(f"Duplicate ipv4_network create entry detected: {net_key}")
-                seen_ipam_creates.add(net_key)
+            # IPAM checks
+            for obj in a.ipam:
+                if isinstance(obj, IPv4NetworkObject):
+                    net_key = (obj.configuration, obj.parent_block, obj.range, obj.type)
+                    if net_key in seen_ipam_network_creates:
+                        raise ValueError(f"Duplicate ipv4_network create entry detected: {net_key}")
+                    seen_ipam_network_creates.add(net_key)
+
+                elif isinstance(obj, IPv4AddressObject):
+                    if a.action == "create":
+                        if obj.addresses:
+                            for address in obj.addresses:
+                                addr_key = (obj.configuration, obj.parent_network, address, obj.type)
+                                if addr_key in deleted_ipv4_addresses:
+                                    raise ValueError(
+                                        f"Conflicting intent: create and delete for the same IPv4 address in one file: {addr_key}"
+                                    )
+                                if addr_key in created_ipv4_addresses:
+                                    raise ValueError(f"Duplicate ipv4_address create entry detected: {addr_key}")
+                                created_ipv4_addresses.add(addr_key)
+
+                        elif obj.next_available_addresses is True:
+                            req_key = (
+                                obj.configuration,
+                                obj.parent_network,
+                                obj.next_available_count or 1,
+                                obj.type,
+                            )
+                            if req_key in seen_next_available_requests:
+                                raise ValueError(f"Duplicate next-available ipv4_address create entry detected: {req_key}")
+                            seen_next_available_requests.add(req_key)
+
+                    elif a.action == "delete":
+                        for address in obj.addresses:
+                            addr_key = (obj.configuration, obj.parent_network, address, obj.type)
+                            if addr_key in created_ipv4_addresses:
+                                raise ValueError(
+                                    f"Conflicting intent: create and delete for the same IPv4 address in one file: {addr_key}"
+                                )
+                            if addr_key in deleted_ipv4_addresses:
+                                raise ValueError(f"Duplicate ipv4_address delete entry detected: {addr_key}")
+                            deleted_ipv4_addresses.add(addr_key)
 
         return self
 
@@ -336,7 +532,6 @@ def main() -> int:
         help="Request YAML files to validate (flag form)",
     )
 
-    # Output directory (keep original default to avoid breaking pipeline)
     parser.add_argument(
         "--out",
         default="out",
@@ -441,4 +636,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-  
