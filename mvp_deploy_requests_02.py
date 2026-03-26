@@ -7,6 +7,12 @@ Supported objects:
   - TXT
 - ipam:
   - IPv4 network (create only)
+  - IPv4 address
+    - create:
+      - explicit addresses
+      - next available addresses
+    - delete:
+      - explicit addresses
 
 Input:
   out/plan.json
@@ -171,14 +177,20 @@ def deploy_txt(api: BamApiClient, item: Dict[str, Any]) -> Tuple[str, str]:
             "name": name,
             "text": text,
         }
-        api.request("POST", f"/api/v2/zones/{zone_id}/resourceRecords", json_body=body)
+        try:
+            api.request("POST", f"/api/v2/zones/{zone_id}/resourceRecords", json_body=body)
+        except requests.exceptions.HTTPError as e:
+            return "FAIL", f"TXT create failed: {e}"
         return "OK", f"Created TXT view={view} zone={zone} name={name} text={text}"
 
     if planned == "delete":
         if not rr_id:
             return "FAIL", "Missing details.rr_id for delete"
 
-        api.request("DELETE", f"/api/v2/resourceRecords/{rr_id}")
+        try:
+            api.request("DELETE", f"/api/v2/resourceRecords/{rr_id}")
+        except requests.exceptions.HTTPError as e:
+            return "FAIL", f"TXT delete failed: {e}"
         return "OK", f"Deleted TXT id={rr_id} view={view} zone={zone} name={name} text={text}"
 
     if not rr_id:
@@ -191,7 +203,10 @@ def deploy_txt(api: BamApiClient, item: Dict[str, Any]) -> Tuple[str, str]:
         "name": name,
         "text": str(new_text),
     }
-    api.request("PUT", f"/api/v2/resourceRecords/{rr_id}", json_body=body)
+    try:
+        api.request("PUT", f"/api/v2/resourceRecords/{rr_id}", json_body=body)
+    except requests.exceptions.HTTPError as e:
+        return "FAIL", f"TXT update failed: {e}"
     return "OK", f"Updated TXT id={rr_id} view={view} zone={zone} name={name} text={text} -> {new_text}"
 
 
@@ -224,6 +239,93 @@ def deploy_ipv4_network(api: BamApiClient, item: Dict[str, Any]) -> Tuple[str, s
         return "FAIL", f"IPv4 network create failed: {e}"
 
     return "OK", f"Created IPv4 network configuration={configuration} parent_block_id={parent_block_id} range={requested_range}"
+
+
+def deploy_ipv4_address(api: BamApiClient, item: Dict[str, Any]) -> Tuple[str, str]:
+    planned = _as_str(item.get("planned")).lower()
+    action = _as_str(item.get("action")).lower()
+
+    parent_network_id = _as_str(item.get("parent_network_id")).strip()
+    configuration = _as_str(item.get("configuration")).strip()
+    parent_network = _as_str(item.get("parent_network")).strip()
+    address = _as_str(item.get("address")).strip()
+    details = item.get("details") or {}
+
+    if planned == "skip":
+        return "SKIP", _as_str(item.get("reason")) or "planned=skip"
+    if planned == "fail":
+        return "FAIL", _as_str(item.get("reason")) or "planned=fail"
+    if planned not in {"create", "delete"}:
+        return "FAIL", f"ipv4_address supports only planned=create or planned=delete in MVP (got: {planned})"
+
+    if not parent_network_id:
+        return "FAIL", "Missing parent_network_id in plan item for ipv4_address"
+
+    if planned == "create":
+        # Next-available batch mode
+        if item.get("next_available_addresses") is True:
+            requested_addresses = details.get("addresses") or []
+            if not isinstance(requested_addresses, list) or not requested_addresses:
+                return "FAIL", "Missing details.addresses for next-available ipv4_address create"
+
+            created_addresses: List[str] = []
+            for addr in requested_addresses:
+                body = {
+                    "type": "IPv4Address",
+                    "state": "STATIC",
+                    "address": str(addr),
+                }
+                try:
+                    api.request("POST", f"/api/v2/networks/{parent_network_id}/addresses", json_body=body)
+                    created_addresses.append(str(addr))
+                except requests.exceptions.HTTPError as e:
+                    return "FAIL", (
+                        f"IPv4 address batch create failed after {len(created_addresses)} successful creates; "
+                        f"failed address={addr}: {e}"
+                    )
+
+            return "OK", (
+                f"Created {len(created_addresses)} IPv4 addresses in parent_network={parent_network} "
+                f"configuration={configuration}: {', '.join(created_addresses)}"
+            )
+
+        # Explicit single-address mode
+        if not address:
+            address = _as_str(details.get("address")).strip()
+        if not address:
+            return "FAIL", "Missing address in plan item for ipv4_address create"
+
+        body = {
+            "type": "IPv4Address",
+            "state": "STATIC",
+            "address": address,
+        }
+        try:
+            api.request("POST", f"/api/v2/networks/{parent_network_id}/addresses", json_body=body)
+        except requests.exceptions.HTTPError as e:
+            return "FAIL", f"IPv4 address create failed for {address}: {e}"
+
+        return "OK", (
+            f"Created IPv4 address configuration={configuration} parent_network={parent_network} address={address}"
+        )
+
+    # planned == delete
+    address_id = _as_str(details.get("address_id")).strip()
+    if not address_id:
+        return "FAIL", "Missing details.address_id for ipv4_address delete"
+    if not address:
+        address = _as_str(details.get("address")).strip()
+
+    try:
+        api.request("DELETE", f"/api/v2/addresses/{address_id}")
+    except requests.exceptions.HTTPError as e:
+        return "FAIL", f"IPv4 address delete failed for {address}: {e}"
+
+    return "OK", (
+        f"Deleted IPv4 address configuration={configuration} parent_network={parent_network} "
+        f"address={address} id={address_id}"
+    )
+
 
 # -----------------------------
 # Reporting
@@ -311,6 +413,21 @@ def main() -> int:
             )
             status, msg = deploy_ipv4_network(api, it)
 
+        elif rr_type == "ipv4_address":
+            if it.get("next_available_addresses") is True:
+                summary = (
+                    f"configuration={it.get('configuration')} parent_network={it.get('parent_network')} "
+                    f"next_available_count={it.get('next_available_count')} {it.get('type')} "
+                    f"action={it.get('action')} planned={it.get('planned')}"
+                )
+            else:
+                summary = (
+                    f"configuration={it.get('configuration')} parent_network={it.get('parent_network')} "
+                    f"address={it.get('address')} {it.get('type')} "
+                    f"action={it.get('action')} planned={it.get('planned')}"
+                )
+            status, msg = deploy_ipv4_address(api, it)
+
         else:
             summary = f"type={it.get('type')} action={it.get('action')} planned={it.get('planned')}"
             status, msg = "SKIP", "Unsupported type in MVP"
@@ -332,3 +449,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+  
