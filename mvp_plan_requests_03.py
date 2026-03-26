@@ -7,6 +7,12 @@ Supported objects:
   - TXT
 - ipam:
   - IPv4 network (create only)
+  - IPv4 address
+    - create:
+      - explicit addresses
+      - next available addresses
+    - delete:
+      - explicit addresses
 
 Input:
   out/normalized_requests.json
@@ -208,6 +214,17 @@ class NetworkRef:
     network_id: str
 
 
+@dataclass(frozen=True)
+class IPv4AddressRef:
+    configuration_id: str
+    configuration_name: str
+    parent_network: str
+    parent_network_id: str
+    address: str
+    address_id: str
+    state: str
+
+
 class BlueCatAdapter:
     def __init__(self, api: BamApiClient) -> None:
         self.api = api
@@ -363,6 +380,47 @@ class BlueCatAdapter:
 
         return matches
 
+    # ---- IPAM / IPv4 Addresses ----
+
+    def ipv4_address_exact_match(self, configuration_id: str, parent_network_id: str, parent_network: str, address: str) -> List[IPv4AddressRef]:
+        data = self.api.request(
+            "GET",
+            f"/api/v2/networks/{parent_network_id}/addresses",
+            params={"filter": f"address:eq('{address}')"},
+        )
+
+        items = data.get("data") or []
+        matches: List[IPv4AddressRef] = []
+
+        for item in items:
+            cfg = item.get("configuration") or {}
+            if str(cfg.get("id", "")) != str(configuration_id):
+                continue
+
+            matches.append(
+                IPv4AddressRef(
+                    configuration_id=str(cfg.get("id", "")),
+                    configuration_name=str(cfg.get("name", "")),
+                    parent_network=parent_network,
+                    parent_network_id=parent_network_id,
+                    address=str(item.get("address", "")),
+                    address_id=str(item["id"]),
+                    state=str(item.get("state", "")),
+                )
+            )
+
+        return matches
+
+    def ipv4_available_addresses(self, parent_network_id: str, limit: int) -> List[str]:
+        data = self.api.request(
+            "GET",
+            f"/api/v2/networks/{parent_network_id}/availableAddresses",
+            params={"limit": limit},
+        )
+
+        items = data.get("data") or []
+        return [str(item.get("address", "")) for item in items if item.get("address")]
+
 
 # -----------------------------
 # Planning Domain
@@ -389,7 +447,12 @@ class PlanItem:
     configuration_id: Optional[str] = None
     parent_block: str = ""
     parent_block_id: Optional[str] = None
+    parent_network: str = ""
+    parent_network_id: Optional[str] = None
     range: str = ""
+    address: str = ""
+    next_available_addresses: bool = False
+    next_available_count: int = 0
 
 
 class Planner:
@@ -402,6 +465,8 @@ class Planner:
             return self.plan_txt(item)
         if item.type == "ipv4_network":
             return self.plan_ipv4_network(item)
+        if item.type == "ipv4_address":
+            return self.plan_ipv4_address(item)
         return self._fail(item, f"Unsupported type: {item.type}")
 
     # ---- TXT ----
@@ -489,8 +554,8 @@ class Planner:
 
         return matches
 
-
     # ---- IPv4 Network (create only) ----
+
     def plan_ipv4_network(self, item: PlanItem) -> PlanItem:
         if item.action != "create":
             return self._fail(item, "ipv4_network currently supports only action=create")
@@ -498,13 +563,11 @@ class Planner:
         if not item.configuration_id:
             return self._fail(item, f"Unsupported configuration name: {item.configuration}")
 
-        # Exact requested parent block must exist
         parent_blocks = self._safe_block_lookup(item.configuration_id, item.parent_block, item)
         if parent_blocks is None:
             return item
 
         if len(parent_blocks) == 0:
-            # Check if it exists as a network instead
             parent_networks = self._safe_network_lookup(item.configuration_id, item.parent_block, item)
             if parent_networks:
                 return self._fail(
@@ -518,7 +581,6 @@ class Planner:
         if self.cfg.fail_on_ambiguous_match and len(parent_blocks) > 1:
             return self._fail(item, "Ambiguous match: more than one exact parent block found", {"match_count": len(parent_blocks)})
 
-        # Determine the most specific existing containing block for the requested range
         containing_blocks = self._safe_containing_blocks_lookup(item.configuration_id, item.range, item)
         if containing_blocks is None:
             return item
@@ -602,6 +664,155 @@ class Planner:
 
         return matches
 
+    # ---- IPv4 Address ----
+
+    def plan_ipv4_address(self, item: PlanItem) -> PlanItem:
+        if item.action not in {"create", "delete"}:
+            return self._fail(item, "ipv4_address currently supports only action=create or action=delete")
+
+        if not item.configuration_id:
+            return self._fail(item, f"Unsupported configuration name: {item.configuration}")
+
+        parent_networks = self._safe_network_lookup(item.configuration_id, item.parent_network, item)
+        if parent_networks is None:
+            return item
+        if len(parent_networks) == 0:
+            return self._fail(item, f"Parent network {item.parent_network} does not exist")
+        if self.cfg.fail_on_ambiguous_match and len(parent_networks) > 1:
+            return self._fail(item, "Ambiguous match: more than one exact parent network found", {"match_count": len(parent_networks)})
+
+        item.parent_network_id = parent_networks[0].network_id
+
+        if item.action == "create":
+            return self._plan_ipv4_address_create(item)
+        return self._plan_ipv4_address_delete(item)
+
+    def _plan_ipv4_address_create(self, item: PlanItem) -> PlanItem:
+        parent_net = None
+        try:
+            parent_net = ipaddress.ip_network(item.parent_network, strict=True)
+        except ValueError as e:
+            return self._fail(item, f"Invalid parent_network CIDR: {e}")
+
+        # Next available mode
+        if item.next_available_addresses:
+            count = item.next_available_count or 1
+            available = self._safe_available_addresses_lookup(item.parent_network_id or "", count, item)
+            if available is None:
+                return item
+            if len(available) < count:
+                return self._fail(
+                    item,
+                    f"Parent network has insufficient available addresses; requested={count} available={len(available)}",
+                    {"requested_count": count, "available_count": len(available)},
+                )
+
+            item.details = {
+                "parent_network_id": item.parent_network_id,
+                "configuration_id": item.configuration_id,
+                "addresses": available[:count],
+                "requested_count": count,
+            }
+            item.address = ",".join(available[:count])
+            return self._create(item, "Requested next available IPv4 addresses are available; create is needed", item.details)
+
+        # Explicit address mode
+        if not item.address:
+            return self._fail(item, "ipv4_address create requires an address or next-available mode")
+
+        try:
+            addr = ipaddress.ip_address(item.address)
+        except ValueError as e:
+            return self._fail(item, f"Invalid IPv4 address: {e}")
+
+        if addr not in parent_net:
+            return self._fail(item, f"Address {item.address} does not reside within parent_network {item.parent_network}")
+
+        existing = self._safe_ipv4_address_lookup(
+            item.configuration_id or "",
+            item.parent_network_id or "",
+            item.parent_network,
+            item.address,
+            item,
+        )
+        if existing is None:
+            return item
+        if len(existing) > 0:
+            return self._fail(item, f"IPv4 address {item.address} already exists in parent network")
+
+        return self._create(
+            item,
+            "Requested IPv4 address does not exist and belongs to the parent network; create is needed",
+            {
+                "parent_network_id": item.parent_network_id,
+                "configuration_id": item.configuration_id,
+                "address": item.address,
+                "state": "STATIC",
+            },
+        )
+
+    def _plan_ipv4_address_delete(self, item: PlanItem) -> PlanItem:
+        if not item.address:
+            return self._fail(item, "ipv4_address delete requires an explicit address")
+
+        existing = self._safe_ipv4_address_lookup(
+            item.configuration_id or "",
+            item.parent_network_id or "",
+            item.parent_network,
+            item.address,
+            item,
+        )
+        if existing is None:
+            return item
+        if len(existing) == 0:
+            return self._fail(item, f"IPv4 address {item.address} does not exist in parent network")
+
+        return self._delete(
+            item,
+            "IPv4 address exists; delete is needed",
+            {
+                "parent_network_id": item.parent_network_id,
+                "configuration_id": item.configuration_id,
+                "address": item.address,
+                "address_id": existing[0].address_id,
+            },
+        )
+
+    def _safe_ipv4_address_lookup(
+        self,
+        configuration_id: str,
+        parent_network_id: str,
+        parent_network: str,
+        address: str,
+        item: PlanItem,
+    ) -> Optional[List[IPv4AddressRef]]:
+        try:
+            matches = self.adapter.ipv4_address_exact_match(
+                configuration_id=configuration_id,
+                parent_network_id=parent_network_id,
+                parent_network=parent_network,
+                address=address,
+            )
+        except Exception as e:
+            updated = self._fail(item, f"IPv4 address lookup error: {e}")
+            item.planned, item.reason, item.details = updated.planned, updated.reason, updated.details
+            return None
+
+        if self.cfg.fail_on_ambiguous_match and len(matches) > 1:
+            updated = self._fail(item, "Ambiguous match: more than one exact IPv4 address found", {"match_count": len(matches)})
+            item.planned, item.reason, item.details = updated.planned, updated.reason, updated.details
+            return None
+
+        return matches
+
+    def _safe_available_addresses_lookup(self, parent_network_id: str, count: int, item: PlanItem) -> Optional[List[str]]:
+        try:
+            return self.adapter.ipv4_available_addresses(parent_network_id=parent_network_id, limit=count)
+        except Exception as e:
+            updated = self._fail(item, f"Available IPv4 addresses lookup error: {e}")
+            item.planned, item.reason, item.details = updated.planned, updated.reason, updated.details
+            return None
+
     # ---- Outcome helpers ----
 
     def _fail(self, item: PlanItem, reason: str, details: Optional[Dict[str, Any]] = None) -> PlanItem:
@@ -653,31 +864,85 @@ def build_plan_items(normalized: Dict[str, Any]) -> List[PlanItem]:
 
             # Process ipam first
             for ipam_obj in (act.get("ipam") or []):
-                if ipam_obj.get("type") != "ipv4_network":
-                    continue
-
+                ipam_type = ipam_obj.get("type")
                 configuration = str(ipam_obj.get("configuration", ""))
-                items.append(
-                    PlanItem(
-                        request_key=request_key,
-                        user_email=user_email,
-                        labels=labels,
-                        view="",
-                        type="ipv4_network",
-                        zone="",
-                        name="",
-                        action=action,
-                        text="",
-                        new_text=None,
-                        planned="fail",
-                        reason="not planned yet",
-                        details={},
-                        configuration=configuration,
-                        configuration_id=resolve_configuration_id(configuration),
-                        parent_block=str(ipam_obj.get("parent_block", "")),
-                        range=str(ipam_obj.get("range", "")),
+
+                if ipam_type == "ipv4_network":
+                    items.append(
+                        PlanItem(
+                            request_key=request_key,
+                            user_email=user_email,
+                            labels=labels,
+                            view="",
+                            type="ipv4_network",
+                            zone="",
+                            name="",
+                            action=action,
+                            text="",
+                            new_text=None,
+                            planned="fail",
+                            reason="not planned yet",
+                            details={},
+                            configuration=configuration,
+                            configuration_id=resolve_configuration_id(configuration),
+                            parent_block=str(ipam_obj.get("parent_block", "")),
+                            range=str(ipam_obj.get("range", "")),
+                        )
                     )
-                )
+
+                elif ipam_type == "ipv4_address":
+                    addresses = ipam_obj.get("addresses") or []
+                    next_available = bool(ipam_obj.get("next_available_addresses") is True)
+                    next_count = int(ipam_obj.get("next_available_count") or 1)
+
+                    # Create one PlanItem per address for explicit mode
+                    if addresses:
+                        for address in addresses:
+                            items.append(
+                                PlanItem(
+                                    request_key=request_key,
+                                    user_email=user_email,
+                                    labels=labels,
+                                    view="",
+                                    type="ipv4_address",
+                                    zone="",
+                                    name="",
+                                    action=action,
+                                    text="",
+                                    new_text=None,
+                                    planned="fail",
+                                    reason="not planned yet",
+                                    details={},
+                                    configuration=configuration,
+                                    configuration_id=resolve_configuration_id(configuration),
+                                    parent_network=str(ipam_obj.get("parent_network", "")),
+                                    address=str(address),
+                                )
+                            )
+                    else:
+                        # Single PlanItem represents a next-available request batch
+                        items.append(
+                            PlanItem(
+                                request_key=request_key,
+                                user_email=user_email,
+                                labels=labels,
+                                view="",
+                                type="ipv4_address",
+                                zone="",
+                                name="",
+                                action=action,
+                                text="",
+                                new_text=None,
+                                planned="fail",
+                                reason="not planned yet",
+                                details={},
+                                configuration=configuration,
+                                configuration_id=resolve_configuration_id(configuration),
+                                parent_network=str(ipam_obj.get("parent_network", "")),
+                                next_available_addresses=next_available,
+                                next_available_count=next_count,
+                            )
+                        )
 
             # Then records
             for rec in (act.get("records") or []):
@@ -721,6 +986,17 @@ def plan_item_summary(it: PlanItem) -> str:
         return (
             f"`{it.type}` configuration=`{it.configuration}` parent_block=`{it.parent_block}` "
             f"range=`{it.range}` action=`{it.action}`"
+        )
+
+    if it.type == "ipv4_address":
+        if it.next_available_addresses:
+            return (
+                f"`{it.type}` configuration=`{it.configuration}` parent_network=`{it.parent_network}` "
+                f"next_available_count=`{it.next_available_count}` action=`{it.action}`"
+            )
+        return (
+            f"`{it.type}` configuration=`{it.configuration}` parent_network=`{it.parent_network}` "
+            f"address=`{it.address}` action=`{it.action}`"
         )
 
     return (
@@ -818,3 +1094,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+  
